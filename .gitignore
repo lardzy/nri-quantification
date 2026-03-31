@@ -1,8 +1,13 @@
 __pycache__/
 *.pyc
+.DS_Store
 .pytest_cache/
 .mypy_cache/
 outputs/
 artifacts/
+frontend/node_modules/
+frontend/dist/
+data/
+exports/
 /.temp/fabrics_ref/
 /.temp/

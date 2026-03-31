@@ -25,6 +25,10 @@ def main(argv: list[str] | None = None) -> int:
     predict_parser.add_argument("--csv", required=True)
     predict_parser.add_argument("--bundle", required=True)
 
+    web_parser = subparsers.add_parser("web", help="Run the spectrum management web application")
+    web_parser.add_argument("--host", default="0.0.0.0")
+    web_parser.add_argument("--port", type=int, default=8000)
+
     args = parser.parse_args(argv)
 
     if args.command == "build-manifest":
@@ -66,6 +70,27 @@ def main(argv: list[str] | None = None) -> int:
 
         result = predict_single_csv(args.csv, args.bundle)
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "web":
+        try:
+            import uvicorn
+        except ModuleNotFoundError as error:
+            if error.name == "uvicorn":
+                raise SystemExit("web command requires web dependencies. Install them with: pip install -e '.[web]'") from error
+            raise
+
+        try:
+            from .manager.config import ManagerSettings
+            from .manager.app import create_app
+        except ModuleNotFoundError as error:
+            if error.name in {"fastapi", "sqlalchemy", "pydantic"}:
+                raise SystemExit("web command requires web dependencies. Install them with: pip install -e '.[web]'") from error
+            raise
+
+        settings = ManagerSettings.from_env()
+        app = create_app(settings)
+        uvicorn.run(app, host=args.host, port=args.port)
         return 0
 
     return 1

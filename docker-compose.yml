@@ -1,0 +1,14 @@
+services:
+  nirq-web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      NIRQ_DB_PATH: /data/spectra.sqlite3
+      IMPORT_ROOTS: /workspace/imports
+      EXPORT_ROOTS: /workspace/exports
+      NIRQ_STATIC_DIR: /app/frontend/dist
+    volumes:
+      - ./data:/data
+      - ./exports:/workspace/exports
+      - ./.temp:/workspace/imports
