@@ -8,6 +8,8 @@ export type SpectrumHit = {
   yValue: number;
 };
 
+export type Extent = [number, number];
+
 export function formatSpectrumLabels(labels: SpectrumItem["labels"]): string {
   return labels.map((item) => `${item.name} ${Number(item.value.toFixed(4))}%`).join(" / ");
 }
@@ -110,4 +112,49 @@ export function formatAxisValue(value: number, axis: "x" | "y"): string {
     maximumFractionDigits: digits
   });
   return formatter.format(Number(value.toFixed(digits)));
+}
+
+export function getSpectraExtents(spectra: SpectrumItem[]): { xExtent: Extent; yExtent: Extent } {
+  let xMin = Number.POSITIVE_INFINITY;
+  let xMax = Number.NEGATIVE_INFINITY;
+  let yMin = Number.POSITIVE_INFINITY;
+  let yMax = Number.NEGATIVE_INFINITY;
+
+  for (const spectrum of spectra) {
+    for (const xValue of spectrum.x_values) {
+      if (Number.isFinite(xValue)) {
+        xMin = Math.min(xMin, xValue);
+        xMax = Math.max(xMax, xValue);
+      }
+    }
+    for (const yValue of spectrum.y_values) {
+      if (Number.isFinite(yValue)) {
+        yMin = Math.min(yMin, yValue);
+        yMax = Math.max(yMax, yValue);
+      }
+    }
+  }
+
+  if (!Number.isFinite(xMin) || !Number.isFinite(xMax) || xMin === xMax) {
+    xMin = 0;
+    xMax = 1;
+  }
+  if (!Number.isFinite(yMin) || !Number.isFinite(yMax) || yMin === yMax) {
+    yMin = 0;
+    yMax = 1;
+  }
+
+  return { xExtent: [xMin, xMax], yExtent: [yMin, yMax] };
+}
+
+export function shiftZoomWindow(start: number, end: number, deltaPercent: number): Extent {
+  const width = Math.max(0, Math.min(100, end) - Math.max(0, start));
+  if (!Number.isFinite(deltaPercent) || width >= 100) {
+    return [Math.max(0, start), Math.min(100, end)];
+  }
+
+  const minStart = 0;
+  const maxStart = 100 - width;
+  const nextStart = Math.min(maxStart, Math.max(minStart, start + deltaPercent));
+  return [nextStart, nextStart + width];
 }

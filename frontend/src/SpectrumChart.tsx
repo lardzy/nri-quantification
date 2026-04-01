@@ -6,7 +6,8 @@ import {
   findNearestSpectrumHit,
   formatAxisValue,
   formatSpectrumLabels,
-  normalizeAxisExtent
+  getSpectraExtents,
+  shiftZoomWindow
 } from "./chartInteraction";
 import type { SpectrumItem } from "./types";
 
@@ -26,6 +27,36 @@ type Props = {
   onQuickExclude: (spectrum: SpectrumItem) => void;
 };
 
+type ZoomWindow = {
+  xStart: number;
+  xEnd: number;
+  yStart: number;
+  yEnd: number;
+};
+
+const X_INSIDE_ZOOM_ID = "x-inside-zoom";
+const Y_INSIDE_ZOOM_ID = "y-inside-zoom";
+const X_SLIDER_ZOOM_ID = "x-slider-zoom";
+const DEFAULT_ZOOM_WINDOW: ZoomWindow = {
+  xStart: 0,
+  xEnd: 100,
+  yStart: 0,
+  yEnd: 100
+};
+
+function readZoomWindowFromOption(option: {
+  dataZoom?: Array<{ id?: string; start?: number; end?: number }>;
+}): ZoomWindow {
+  const currentZooms = option.dataZoom ?? [];
+  const readById = (id: string) => currentZooms.find((item) => item.id === id);
+  return {
+    xStart: readById(X_INSIDE_ZOOM_ID)?.start ?? readById(X_SLIDER_ZOOM_ID)?.start ?? DEFAULT_ZOOM_WINDOW.xStart,
+    xEnd: readById(X_INSIDE_ZOOM_ID)?.end ?? readById(X_SLIDER_ZOOM_ID)?.end ?? DEFAULT_ZOOM_WINDOW.xEnd,
+    yStart: readById(Y_INSIDE_ZOOM_ID)?.start ?? DEFAULT_ZOOM_WINDOW.yStart,
+    yEnd: readById(Y_INSIDE_ZOOM_ID)?.end ?? DEFAULT_ZOOM_WINDOW.yEnd
+  };
+}
+
 export function SpectrumChart({
   spectra,
   resetSignal,
@@ -44,11 +75,12 @@ export function SpectrumChart({
   const lockCallbackRef = useRef(onLockSpectrum);
   const quickExcludeCallbackRef = useRef(onQuickExclude);
   const optionRef = useRef<Record<string, unknown> | null>(null);
+  const zoomWindowRef = useRef<ZoomWindow>(DEFAULT_ZOOM_WINDOW);
   const panStateRef = useRef<{
     startPixel: { x: number; y: number };
-    startData: [number, number];
-    xExtent: [number, number];
-    yExtent: [number, number];
+    startZoom: ZoomWindow;
+    dataPerPixelX: number;
+    dataPerPixelY: number;
     moved: boolean;
   } | null>(null);
   const ignoreNextClickRef = useRef(false);
@@ -71,13 +103,28 @@ export function SpectrumChart({
   }, [onQuickExclude]);
 
   const activeSpectrumId = hoveredSpectrumId ?? lockedSpectrumId;
+  const axisExtents = useMemo(() => getSpectraExtents(spectra), [spectra]);
 
   const option = useMemo(() => {
+    const yLabelRich = {
+      axisValue: {
+        width: 74,
+        align: "right",
+        fontFamily: '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace'
+      }
+    };
+    const xLabelRich = {
+      axisValue: {
+        width: 76,
+        align: "center",
+        fontFamily: '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace'
+      }
+    };
     return {
       animation: false,
       backgroundColor: "#fcfcfd",
       tooltip: { show: false },
-      grid: { left: 104, right: 36, top: 36, bottom: 96, containLabel: true },
+      grid: { left: 118, right: 36, top: 36, bottom: 102, containLabel: false },
       xAxis: {
         type: "value",
         name: spectra[0]?.axis_unit === "nm" ? "波长 (nm)" : "X",
@@ -85,7 +132,14 @@ export function SpectrumChart({
         nameGap: 46,
         nameTextStyle: { fontWeight: 600, padding: [18, 0, 0, 0] },
         scale: true,
-        axisLabel: { color: "#475467", margin: 12, formatter: (value: number) => formatAxisValue(value, "x") },
+        splitNumber: 6,
+        axisLabel: {
+          color: "#475467",
+          margin: 12,
+          hideOverlap: true,
+          formatter: (value: number) => `{axisValue|${formatAxisValue(value, "x")}}`,
+          rich: xLabelRich
+        },
         splitLine: { lineStyle: { color: "rgba(15, 23, 42, 0.08)" } }
       },
       yAxis: {
@@ -95,15 +149,39 @@ export function SpectrumChart({
         nameGap: 74,
         nameTextStyle: { fontWeight: 600, padding: [0, 0, 14, 0] },
         scale: true,
-        axisLabel: { color: "#475467", margin: 12, formatter: (value: number) => formatAxisValue(value, "y") },
+        splitNumber: 6,
+        axisLabel: {
+          color: "#475467",
+          margin: 14,
+          formatter: (value: number) => `{axisValue|${formatAxisValue(value, "y")}}`,
+          rich: yLabelRich
+        },
         splitLine: { lineStyle: { color: "rgba(15, 23, 42, 0.08)" } }
       },
       dataZoom: [
-        { type: "inside", xAxisIndex: 0 },
-        { type: "inside", yAxisIndex: 0 },
         {
+          id: X_INSIDE_ZOOM_ID,
+          type: "inside",
+          xAxisIndex: 0,
+          filterMode: "none",
+          moveOnMouseMove: false,
+          moveOnMouseWheel: false,
+          zoomOnMouseWheel: true
+        },
+        {
+          id: Y_INSIDE_ZOOM_ID,
+          type: "inside",
+          yAxisIndex: 0,
+          filterMode: "none",
+          moveOnMouseMove: false,
+          moveOnMouseWheel: false,
+          zoomOnMouseWheel: true
+        },
+        {
+          id: X_SLIDER_ZOOM_ID,
           type: "slider",
           xAxisIndex: 0,
+          filterMode: "none",
           bottom: 8,
           height: 18,
           borderColor: "rgba(15, 23, 42, 0.08)"
@@ -150,6 +228,25 @@ export function SpectrumChart({
       }
     };
 
+    const readCurrentZoomWindow = (): ZoomWindow =>
+      readZoomWindowFromOption(
+        chart.getOption() as {
+          dataZoom?: Array<{ id?: string; start?: number; end?: number }>;
+        }
+      );
+
+    const dispatchZoomWindow = (nextZoom: ZoomWindow) => {
+      zoomWindowRef.current = nextZoom;
+      chart.dispatchAction({
+        type: "dataZoom",
+        batch: [
+          { dataZoomId: X_INSIDE_ZOOM_ID, start: nextZoom.xStart, end: nextZoom.xEnd },
+          { dataZoomId: X_SLIDER_ZOOM_ID, start: nextZoom.xStart, end: nextZoom.xEnd },
+          { dataZoomId: Y_INSIDE_ZOOM_ID, start: nextZoom.yStart, end: nextZoom.yEnd }
+        ]
+      });
+    };
+
     const resolveHitAtPointer = (pointer: { x: number; y: number } | null) => {
       const chartInstance = chartRef.current;
       if (!chartInstance || !pointer) {
@@ -177,28 +274,6 @@ export function SpectrumChart({
       });
     };
 
-    const readAxisExtent = (axisType: "xAxis" | "yAxis"): [number, number] | null => {
-      const model = (chart as unknown as { getModel: () => any }).getModel();
-      const axis = model?.getComponent(axisType, 0)?.axis;
-      const extent = axis?.scale?.getExtent?.();
-      if (!Array.isArray(extent) || extent.length < 2) {
-        return null;
-      }
-      return [Number(extent[0]), Number(extent[1])];
-    };
-
-    const applyViewport = (xExtent: [number, number], yExtent: [number, number]) => {
-      const normalizedX = normalizeAxisExtent(xExtent, "x");
-      const normalizedY = normalizeAxisExtent(yExtent, "y");
-      chart.setOption(
-        {
-          xAxis: { min: normalizedX[0], max: normalizedX[1] },
-          yAxis: { min: normalizedY[0], max: normalizedY[1] }
-        },
-        { notMerge: false, lazyUpdate: true }
-      );
-    };
-
     const quickExcludeAtPointer = (pointer: { x: number; y: number } | null) => {
       const hit = resolveHitAtPointer(pointer);
       if (!hit) {
@@ -206,6 +281,10 @@ export function SpectrumChart({
       }
       clearHover();
       quickExcludeCallbackRef.current(hit.spectrum);
+    };
+
+    const syncZoomWindow = () => {
+      zoomWindowRef.current = readCurrentZoomWindow();
     };
 
     const updateHover = () => {
@@ -233,23 +312,39 @@ export function SpectrumChart({
       animationFrameRef.current = requestAnimationFrame(updateHover);
     };
 
+    chart.on("datazoom", syncZoomWindow);
+
     chart.getZr().on("mousemove", (event) => {
       const panState = panStateRef.current;
       if (panState) {
-        const currentPoint = chart.convertFromPixel({ xAxisIndex: 0, yAxisIndex: 0 }, [event.offsetX, event.offsetY]) as number[] | undefined;
-        if (!Array.isArray(currentPoint) || currentPoint.length < 2) {
-          return;
-        }
-        const deltaX = panState.startData[0] - currentPoint[0];
-        const deltaY = panState.startData[1] - currentPoint[1];
+        const pixelDeltaX = event.offsetX - panState.startPixel.x;
+        const pixelDeltaY = event.offsetY - panState.startPixel.y;
+        const deltaX = -pixelDeltaX * panState.dataPerPixelX;
+        const deltaY = -pixelDeltaY * panState.dataPerPixelY;
+        const xSpan = axisExtents.xExtent[1] - axisExtents.xExtent[0];
+        const ySpan = axisExtents.yExtent[1] - axisExtents.yExtent[0];
+        const xDeltaPercent = xSpan > 0 ? (deltaX / xSpan) * 100 : 0;
+        const yDeltaPercent = ySpan > 0 ? (deltaY / ySpan) * 100 : 0;
+        const [nextXStart, nextXEnd] = shiftZoomWindow(
+          panState.startZoom.xStart,
+          panState.startZoom.xEnd,
+          xDeltaPercent
+        );
+        const [nextYStart, nextYEnd] = shiftZoomWindow(
+          panState.startZoom.yStart,
+          panState.startZoom.yEnd,
+          yDeltaPercent
+        );
         panState.moved =
           panState.moved ||
           Math.abs(event.offsetX - panState.startPixel.x) > 2 ||
           Math.abs(event.offsetY - panState.startPixel.y) > 2;
-        applyViewport(
-          [panState.xExtent[0] + deltaX, panState.xExtent[1] + deltaX],
-          [panState.yExtent[0] + deltaY, panState.yExtent[1] + deltaY]
-        );
+        dispatchZoomWindow({
+          xStart: nextXStart,
+          xEnd: nextXEnd,
+          yStart: nextYStart,
+          yEnd: nextYEnd
+        });
         return;
       }
       scheduleHover(event.offsetX, event.offsetY);
@@ -261,24 +356,22 @@ export function SpectrumChart({
         return;
       }
       if (button === 2) {
+        nativeEvent?.preventDefault?.();
         quickExcludeAtPointer({ x: event.offsetX, y: event.offsetY });
         return;
       }
       if (button !== 1) {
         return;
       }
-      const startData = chart.convertFromPixel({ xAxisIndex: 0, yAxisIndex: 0 }, [event.offsetX, event.offsetY]) as number[] | undefined;
-      const xExtent = readAxisExtent("xAxis");
-      const yExtent = readAxisExtent("yAxis");
-      if (!Array.isArray(startData) || startData.length < 2 || !xExtent || !yExtent) {
-        return;
-      }
+      nativeEvent?.preventDefault?.();
       clearHover();
+      const ref0 = chart.convertFromPixel({ xAxisIndex: 0, yAxisIndex: 0 }, [0, 0]);
+      const ref1 = chart.convertFromPixel({ xAxisIndex: 0, yAxisIndex: 0 }, [1, 1]);
       panStateRef.current = {
         startPixel: { x: event.offsetX, y: event.offsetY },
-        startData: [startData[0], startData[1]],
-        xExtent,
-        yExtent,
+        startZoom: zoomWindowRef.current,
+        dataPerPixelX: ref1[0] - ref0[0],
+        dataPerPixelY: ref1[1] - ref0[1],
         moved: false
       };
     });
@@ -316,23 +409,30 @@ export function SpectrumChart({
     return () => {
       clearHover();
       panStateRef.current = null;
+      chart.off("datazoom", syncZoomWindow);
       containerRef.current?.removeEventListener("contextmenu", preventContextMenu);
       resizeObserver.disconnect();
       chart.dispose();
       chartRef.current = null;
     };
-  }, []);
+  }, [axisExtents.xExtent, axisExtents.yExtent]);
 
   useEffect(() => {
     if (chartRef.current) {
       optionRef.current = option as Record<string, unknown>;
       chartRef.current.setOption(option, { notMerge: false, lazyUpdate: true });
+      zoomWindowRef.current = readZoomWindowFromOption(
+        chartRef.current.getOption() as {
+          dataZoom?: Array<{ id?: string; start?: number; end?: number }>;
+        }
+      );
     }
   }, [option]);
 
   useEffect(() => {
     if (chartRef.current && optionRef.current) {
       chartRef.current.setOption(optionRef.current, true);
+      zoomWindowRef.current = DEFAULT_ZOOM_WINDOW;
     }
   }, [resetSignal]);
 
