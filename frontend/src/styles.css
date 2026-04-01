@@ -23,12 +23,31 @@ body {
 
 .workspace-sider {
   background: transparent !important;
+  transition: all 0.28s ease !important;
+}
+
+.workspace-sider.left-sider {
   border-inline-end: 1px solid rgba(15, 23, 42, 0.08);
+}
+
+.workspace-sider.right-sider {
+  border-inline-start: 1px solid rgba(15, 23, 42, 0.08);
 }
 
 .workspace-sider .ant-layout-sider-children {
   padding: 18px 14px;
   overflow-y: auto;
+  transition: opacity 0.22s ease, padding 0.22s ease;
+}
+
+.workspace-sider.ant-layout-sider-collapsed {
+  border: none !important;
+}
+
+.workspace-sider.ant-layout-sider-collapsed .ant-layout-sider-children {
+  padding-inline: 0;
+  opacity: 0;
+  overflow: hidden;
 }
 
 .workspace-panel-stack {
@@ -37,32 +56,45 @@ body {
   gap: 14px;
 }
 
-.workspace-header {
-  height: auto;
-  min-height: 0;
-  padding: 14px 18px 0;
-  background: transparent;
-  border-bottom: none;
-}
-
-.workspace-header-card {
-  width: 100%;
-  padding: 14px 18px;
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.82);
-  backdrop-filter: blur(18px);
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-
 .workspace-content {
   padding: 14px 18px 18px;
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.workspace-control-rail {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.panel-toggle-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 48px;
+  overflow: hidden;
+  transition: padding-inline 0.24s ease, box-shadow 0.24s ease;
+}
+
+.panel-toggle-label {
+  display: inline-block;
+  max-width: 96px;
+  opacity: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  transition: max-width 0.24s ease, opacity 0.2s ease;
+}
+
+.panel-toggle-button.is-collapsed {
+  padding-inline: 10px !important;
+}
+
+.panel-toggle-button.is-collapsed .panel-toggle-label {
+  max-width: 0;
+  opacity: 0;
 }
 
 .status-strip .ant-card-body {
@@ -108,6 +140,20 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.scroll-list-wrap {
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.class-list-wrap {
+  max-height: min(52vh, 680px);
+}
+
+.jobs-list-wrap,
+.excluded-list-wrap {
+  max-height: min(24vh, 260px);
 }
 
 .class-list-item {
@@ -192,6 +238,36 @@ body {
   border-radius: 20px;
   background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
   border: 1px solid rgba(15, 23, 42, 0.08);
+  cursor: crosshair;
+}
+
+.current-class-pill {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-card .ant-card-body {
+  padding-top: 14px;
+}
+
+.detail-card-scroll {
+  max-height: 300px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.detail-file-name {
+  margin-bottom: 6px !important;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.detail-value-text {
+  display: block;
+  max-width: 100%;
+  word-break: break-all;
 }
 
 .detail-descriptions-compact .ant-descriptions-view table {
@@ -256,6 +332,11 @@ body {
   margin-bottom: 4px !important;
 }
 
+.scroll-card .ant-card-body {
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+
 .ellipsis-text {
   display: inline-block;
   max-width: 100%;
@@ -263,6 +344,19 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   vertical-align: bottom;
+}
+
+.unsupported-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.unsupported-card {
+  width: min(520px, 100%);
+  border-radius: 24px !important;
 }
 
 @media (max-width: 1400px) {
@@ -292,16 +386,18 @@ body {
     border-bottom: 1px solid rgba(15, 23, 42, 0.08);
   }
 
-  .workspace-header {
-    padding: 12px 16px 0;
-  }
-
   .workspace-content {
     padding: 12px 16px 16px;
   }
 
   .chart-surface {
     height: 480px;
+  }
+
+  .class-list-wrap,
+  .jobs-list-wrap,
+  .excluded-list-wrap {
+    max-height: none;
   }
 }
 
@@ -310,7 +406,6 @@ body {
     grid-template-columns: 1fr;
   }
 
-  .workspace-header-card,
   .subset-mode-control {
     align-items: stretch;
     flex-direction: column;

@@ -88,25 +88,17 @@ class JobManager:
 
         subsets: list[dict[str, Any]] = []
         if mode == "count":
-            parts = max(1, parts or 1)
-            chunk_size = max(1, len(spectrum_ids) // parts + (1 if len(spectrum_ids) % parts else 0))
+            chunk_size = max(1, parts or 1)
             groups = [spectrum_ids[index:index + chunk_size] for index in range(0, len(spectrum_ids), chunk_size)]
         else:
-            ratios = ratios or [1.0]
-            ratio_sum = sum(ratios) or 1.0
-            sizes = []
-            remaining = len(spectrum_ids)
-            used = 0
-            for index, ratio in enumerate(ratios):
-                if index == len(ratios) - 1:
-                    size = remaining
-                else:
-                    size = round(len(spectrum_ids) * ratio / ratio_sum)
-                    remaining -= size
-                sizes.append(size)
+            raw_partition_count = parts if parts is not None else int(ratios[0]) if ratios else 1
+            partition_count = max(1, raw_partition_count)
+            base_size = len(spectrum_ids) // partition_count
+            remainder = len(spectrum_ids) % partition_count
             groups = []
             cursor = 0
-            for size in sizes:
+            for index in range(partition_count):
+                size = base_size + (1 if index < remainder else 0)
                 groups.append(spectrum_ids[cursor:cursor + size])
                 cursor += size
 

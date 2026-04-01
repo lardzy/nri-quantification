@@ -55,13 +55,21 @@ class ManagerTests(unittest.TestCase):
     def test_import_classification_subset_and_exclusion_flow(self) -> None:
         nested_a = self.import_root / "batch-a"
         nested_b = self.import_root / "batch-b"
+        nested_c = self.import_root / "batch-c"
+        nested_d = self.import_root / "batch-d"
         nested_a.mkdir()
         nested_b.mkdir()
+        nested_c.mkdir()
+        nested_d.mkdir()
 
         file_name_a = "ISC_Hadamard 1_棉,70.0,锦纶,30.0_ABC123_20240101_120000_1.csv"
         file_name_b = "ISC_Hadamard 1_锦纶,20.0,棉,80.0_DEF456_20240101_120100_1.csv"
+        file_name_c = "ISC_Hadamard 1_棉,65.0,锦纶,35.0_GHI789_20240101_120200_1.csv"
+        file_name_d = "ISC_Hadamard 1_锦纶,10.0,棉,90.0_JKL012_20240101_120300_1.csv"
         (nested_a / file_name_a).write_text(make_csv_text([("棉", 70.0), ("锦纶", 30.0)]), encoding="utf-8")
         (nested_b / file_name_b).write_text(make_csv_text([("锦纶", 20.0), ("棉", 80.0)]), encoding="utf-8")
+        (nested_c / file_name_c).write_text(make_csv_text([("棉", 65.0), ("锦纶", 35.0)]), encoding="utf-8")
+        (nested_d / file_name_d).write_text(make_csv_text([("锦纶", 10.0), ("棉", 90.0)]), encoding="utf-8")
         duplicate_dir = nested_b / "duplicates"
         duplicate_dir.mkdir()
         (duplicate_dir / file_name_a).write_text(make_csv_text([("棉", 70.0), ("锦纶", 30.0)]), encoding="utf-8")
@@ -69,8 +77,8 @@ class ManagerTests(unittest.TestCase):
         job = self.client.post("/api/import-jobs", json={"root_path": str(self.import_root), "recursive": True}).json()
         completed = self._wait_for_job(job["id"])
         self.assertEqual(completed["status"], "completed")
-        self.assertEqual(completed["total_discovered"], 3)
-        self.assertEqual(completed["imported_count"], 2)
+        self.assertEqual(completed["total_discovered"], 5)
+        self.assertEqual(completed["imported_count"], 4)
         self.assertEqual(completed["skipped_count"], 1)
         self.assertEqual(completed["failed_count"], 0)
 
@@ -80,14 +88,14 @@ class ManagerTests(unittest.TestCase):
         classes = self.client.get("/api/classes", params={"sort": "name"}).json()["items"]
         self.assertEqual(len(classes), 1)
         self.assertEqual(classes[0]["class_key"], "棉|锦纶")
-        self.assertEqual(classes[0]["total_count"], 2)
+        self.assertEqual(classes[0]["total_count"], 4)
 
         class_key = classes[0]["class_key"]
         spectra_payload = self.client.get(
             "/api/spectra",
             params={"class_key": class_key, "excluded": "active", "limit": 1},
         ).json()
-        self.assertEqual(spectra_payload["count"], 2)
+        self.assertEqual(spectra_payload["count"], 4)
         self.assertEqual(len(spectra_payload["items"]), 1)
 
         subset_payload = self.client.post(
@@ -95,16 +103,24 @@ class ManagerTests(unittest.TestCase):
             json={"mode": "count", "parts": 2},
         ).json()
         self.assertEqual(len(subset_payload["subsets"]), 2)
-        subset_ids = [item["subset_id"] for item in subset_payload["subsets"]]
         subset_counts = [item["count"] for item in subset_payload["subsets"]]
-        self.assertEqual(subset_counts, [1, 1])
+        self.assertEqual(subset_counts, [2, 2])
+
+        ratio_subset_payload = self.client.post(
+            f"/api/classes/{class_key}/subsets",
+            json={"mode": "ratio", "parts": 2},
+        ).json()
+        self.assertEqual(len(ratio_subset_payload["subsets"]), 2)
+        ratio_subset_ids = [item["subset_id"] for item in ratio_subset_payload["subsets"]]
+        ratio_subset_counts = [item["count"] for item in ratio_subset_payload["subsets"]]
+        self.assertEqual(ratio_subset_counts, [2, 2])
 
         subset_spectra = self.client.get(
             "/api/spectra",
-            params={"class_key": class_key, "excluded": "active", "subset_id": subset_ids[0], "limit": 2000},
+            params={"class_key": class_key, "excluded": "active", "subset_id": ratio_subset_ids[0], "limit": 2000},
         ).json()
-        self.assertEqual(subset_spectra["count"], 1)
-        self.assertEqual(len(subset_spectra["items"]), 1)
+        self.assertEqual(subset_spectra["count"], 2)
+        self.assertEqual(len(subset_spectra["items"]), 2)
 
         spectrum_id = subset_spectra["items"][0]["id"]
         excluded = self.client.post(f"/api/spectra/{spectrum_id}/exclude").json()

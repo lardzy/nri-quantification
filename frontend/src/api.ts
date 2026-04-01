@@ -63,7 +63,7 @@ export const api = {
     const data = await request<{ items: SpectrumItem[] }>("/api/excluded/recent?limit=50");
     return data.items;
   },
-  async createSubsets(classKey: string, payload: { mode: "count" | "ratio"; parts?: number; ratios?: number[] }): Promise<{
+  async createSubsets(classKey: string, payload: { mode: "count" | "ratio"; parts: number }): Promise<{
     class_key: string;
     mode: string;
     subsets: SubsetSummary[];

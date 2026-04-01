@@ -75,3 +75,39 @@ export function findNearestSpectrumHit(params: {
 
   return bestHit;
 }
+
+export function getAxisFractionDigits(span: number, axis: "x" | "y"): number {
+  const safeSpan = Number.isFinite(span) && span > 0 ? span : 1;
+  if (axis === "x") {
+    if (safeSpan >= 100) {
+      return 0;
+    }
+    if (safeSpan >= 10) {
+      return 1;
+    }
+    return 2;
+  }
+
+  if (safeSpan >= 1) {
+    return 3;
+  }
+  if (safeSpan >= 0.1) {
+    return 4;
+  }
+  return 5;
+}
+
+export function normalizeAxisExtent(extent: [number, number], axis: "x" | "y"): [number, number] {
+  const span = Math.abs(extent[1] - extent[0]);
+  const digits = getAxisFractionDigits(span, axis);
+  return [Number(extent[0].toFixed(digits)), Number(extent[1].toFixed(digits))];
+}
+
+export function formatAxisValue(value: number, axis: "x" | "y"): string {
+  const digits = axis === "x" ? 2 : 4;
+  const formatter = new Intl.NumberFormat("zh-CN", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: digits
+  });
+  return formatter.format(Number(value.toFixed(digits)));
+}

@@ -2,7 +2,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as echarts from "echarts";
 import type { EChartsType } from "echarts";
 import { Tag } from "antd";
-import { findNearestSpectrumHit, formatSpectrumLabels } from "./chartInteraction";
+import {
+  findNearestSpectrumHit,
+  formatAxisValue,
+  formatSpectrumLabels,
+  normalizeAxisExtent
+} from "./chartInteraction";
 import type { SpectrumItem } from "./types";
 
 type HoverPreview = {
@@ -18,7 +23,7 @@ type Props = {
   lockedSpectrumId: number | null;
   onHoverSpectrum: (spectrum: SpectrumItem | null) => void;
   onLockSpectrum: (spectrum: SpectrumItem | null) => void;
-  onExclude: (spectrum: SpectrumItem) => void;
+  onQuickExclude: (spectrum: SpectrumItem) => void;
 };
 
 export function SpectrumChart({
@@ -28,18 +33,25 @@ export function SpectrumChart({
   lockedSpectrumId,
   onHoverSpectrum,
   onLockSpectrum,
-  onExclude
+  onQuickExclude
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<EChartsType | null>(null);
-  const hitRef = useRef<SpectrumItem | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const latestPointerRef = useRef<{ x: number; y: number } | null>(null);
   const spectraRef = useRef<SpectrumItem[]>(spectra);
   const hoverCallbackRef = useRef(onHoverSpectrum);
   const lockCallbackRef = useRef(onLockSpectrum);
-  const excludeCallbackRef = useRef(onExclude);
+  const quickExcludeCallbackRef = useRef(onQuickExclude);
   const optionRef = useRef<Record<string, unknown> | null>(null);
+  const panStateRef = useRef<{
+    startPixel: { x: number; y: number };
+    startData: [number, number];
+    xExtent: [number, number];
+    yExtent: [number, number];
+    moved: boolean;
+  } | null>(null);
+  const ignoreNextClickRef = useRef(false);
   const [preview, setPreview] = useState<HoverPreview | null>(null);
 
   useEffect(() => {
@@ -55,8 +67,8 @@ export function SpectrumChart({
   }, [onLockSpectrum]);
 
   useEffect(() => {
-    excludeCallbackRef.current = onExclude;
-  }, [onExclude]);
+    quickExcludeCallbackRef.current = onQuickExclude;
+  }, [onQuickExclude]);
 
   const activeSpectrumId = hoveredSpectrumId ?? lockedSpectrumId;
 
@@ -65,25 +77,25 @@ export function SpectrumChart({
       animation: false,
       backgroundColor: "#fcfcfd",
       tooltip: { show: false },
-      grid: { left: 88, right: 32, top: 28, bottom: 88, containLabel: true },
+      grid: { left: 104, right: 36, top: 36, bottom: 96, containLabel: true },
       xAxis: {
         type: "value",
         name: spectra[0]?.axis_unit === "nm" ? "波长 (nm)" : "X",
         nameLocation: "middle",
-        nameGap: 42,
+        nameGap: 46,
         nameTextStyle: { fontWeight: 600, padding: [18, 0, 0, 0] },
         scale: true,
-        axisLabel: { color: "#475467", margin: 12 },
+        axisLabel: { color: "#475467", margin: 12, formatter: (value: number) => formatAxisValue(value, "x") },
         splitLine: { lineStyle: { color: "rgba(15, 23, 42, 0.08)" } }
       },
       yAxis: {
         type: "value",
         name: "吸光度",
         nameLocation: "middle",
-        nameGap: 64,
-        nameTextStyle: { fontWeight: 600, padding: [0, 0, 10, 0] },
+        nameGap: 74,
+        nameTextStyle: { fontWeight: 600, padding: [0, 0, 14, 0] },
         scale: true,
-        axisLabel: { color: "#475467", margin: 12 },
+        axisLabel: { color: "#475467", margin: 12, formatter: (value: number) => formatAxisValue(value, "y") },
         splitLine: { lineStyle: { color: "rgba(15, 23, 42, 0.08)" } }
       },
       dataZoom: [
@@ -126,9 +138,10 @@ export function SpectrumChart({
     chartRef.current = chart;
     const resizeObserver = new ResizeObserver(() => chart.resize());
     resizeObserver.observe(containerRef.current);
+    const preventContextMenu = (event: MouseEvent) => event.preventDefault();
+    containerRef.current.addEventListener("contextmenu", preventContextMenu);
 
     const clearHover = () => {
-      hitRef.current = null;
       setPreview(null);
       hoverCallbackRef.current(null);
       if (animationFrameRef.current !== null) {
@@ -164,6 +177,37 @@ export function SpectrumChart({
       });
     };
 
+    const readAxisExtent = (axisType: "xAxis" | "yAxis"): [number, number] | null => {
+      const model = (chart as unknown as { getModel: () => any }).getModel();
+      const axis = model?.getComponent(axisType, 0)?.axis;
+      const extent = axis?.scale?.getExtent?.();
+      if (!Array.isArray(extent) || extent.length < 2) {
+        return null;
+      }
+      return [Number(extent[0]), Number(extent[1])];
+    };
+
+    const applyViewport = (xExtent: [number, number], yExtent: [number, number]) => {
+      const normalizedX = normalizeAxisExtent(xExtent, "x");
+      const normalizedY = normalizeAxisExtent(yExtent, "y");
+      chart.setOption(
+        {
+          xAxis: { min: normalizedX[0], max: normalizedX[1] },
+          yAxis: { min: normalizedY[0], max: normalizedY[1] }
+        },
+        { notMerge: false, lazyUpdate: true }
+      );
+    };
+
+    const quickExcludeAtPointer = (pointer: { x: number; y: number } | null) => {
+      const hit = resolveHitAtPointer(pointer);
+      if (!hit) {
+        return;
+      }
+      clearHover();
+      quickExcludeCallbackRef.current(hit.spectrum);
+    };
+
     const updateHover = () => {
       animationFrameRef.current = null;
       const pointer = latestPointerRef.current;
@@ -173,7 +217,6 @@ export function SpectrumChart({
         return;
       }
 
-      hitRef.current = hit.spectrum;
       hoverCallbackRef.current(hit.spectrum);
       setPreview({
         spectrum: hit.spectrum,
@@ -191,21 +234,89 @@ export function SpectrumChart({
     };
 
     chart.getZr().on("mousemove", (event) => {
-      scheduleHover(event.offsetX, event.offsetY);
-    });
-    chart.getZr().on("globalout", clearHover);
-    chart.getZr().on("click", (event) => {
-      const hit = resolveHitAtPointer({ x: event.offsetX, y: event.offsetY });
-      if (!hit) {
+      const panState = panStateRef.current;
+      if (panState) {
+        const currentPoint = chart.convertFromPixel({ xAxisIndex: 0, yAxisIndex: 0 }, [event.offsetX, event.offsetY]) as number[] | undefined;
+        if (!Array.isArray(currentPoint) || currentPoint.length < 2) {
+          return;
+        }
+        const deltaX = panState.startData[0] - currentPoint[0];
+        const deltaY = panState.startData[1] - currentPoint[1];
+        panState.moved =
+          panState.moved ||
+          Math.abs(event.offsetX - panState.startPixel.x) > 2 ||
+          Math.abs(event.offsetY - panState.startPixel.y) > 2;
+        applyViewport(
+          [panState.xExtent[0] + deltaX, panState.xExtent[1] + deltaX],
+          [panState.yExtent[0] + deltaY, panState.yExtent[1] + deltaY]
+        );
         return;
       }
-      hitRef.current = hit.spectrum;
+      scheduleHover(event.offsetX, event.offsetY);
+    });
+    chart.getZr().on("mousedown", (event) => {
+      const nativeEvent = event.event as MouseEvent | undefined;
+      const button = nativeEvent?.button ?? 0;
+      if (!chart.containPixel({ gridIndex: 0 }, [event.offsetX, event.offsetY])) {
+        return;
+      }
+      if (button === 2) {
+        quickExcludeAtPointer({ x: event.offsetX, y: event.offsetY });
+        return;
+      }
+      if (button !== 1) {
+        return;
+      }
+      const startData = chart.convertFromPixel({ xAxisIndex: 0, yAxisIndex: 0 }, [event.offsetX, event.offsetY]) as number[] | undefined;
+      const xExtent = readAxisExtent("xAxis");
+      const yExtent = readAxisExtent("yAxis");
+      if (!Array.isArray(startData) || startData.length < 2 || !xExtent || !yExtent) {
+        return;
+      }
+      clearHover();
+      panStateRef.current = {
+        startPixel: { x: event.offsetX, y: event.offsetY },
+        startData: [startData[0], startData[1]],
+        xExtent,
+        yExtent,
+        moved: false
+      };
+    });
+    chart.getZr().on("mouseup", () => {
+      if (panStateRef.current?.moved) {
+        ignoreNextClickRef.current = true;
+      }
+      panStateRef.current = null;
+    });
+    chart.getZr().on("globalout", () => {
+      panStateRef.current = null;
+      clearHover();
+    });
+    chart.getZr().on("click", (event) => {
+      const nativeEvent = event.event as MouseEvent | undefined;
+      if ((nativeEvent?.button ?? 0) !== 0) {
+        return;
+      }
+      if (ignoreNextClickRef.current) {
+        ignoreNextClickRef.current = false;
+        return;
+      }
+      const hit = resolveHitAtPointer({ x: event.offsetX, y: event.offsetY });
+      if (!hit) {
+        lockCallbackRef.current(null);
+        return;
+      }
+      if (nativeEvent?.shiftKey) {
+        quickExcludeAtPointer({ x: event.offsetX, y: event.offsetY });
+        return;
+      }
       lockCallbackRef.current(hit.spectrum);
-      excludeCallbackRef.current(hit.spectrum);
     });
 
     return () => {
       clearHover();
+      panStateRef.current = null;
+      containerRef.current?.removeEventListener("contextmenu", preventContextMenu);
       resizeObserver.disconnect();
       chart.dispose();
       chartRef.current = null;
