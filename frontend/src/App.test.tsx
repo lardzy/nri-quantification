@@ -238,6 +238,31 @@ describe("App", () => {
     await waitFor(() => expect(api.excludeSpectrum).toHaveBeenCalledWith(baseSpectrum.id));
   });
 
+  it("shows excluded spectra again when the preview filter switches to only excluded", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await waitFor(() => expect(api.getSpectra).toHaveBeenCalled());
+    const curveButton = await screen.findByRole("button", { name: baseSpectrum.file_name });
+
+    fireEvent.click(curveButton, { shiftKey: true });
+    await waitFor(() => expect(api.excludeSpectrum).toHaveBeenCalledWith(baseSpectrum.id));
+    await waitFor(() => expect(screen.queryByRole("button", { name: baseSpectrum.file_name })).not.toBeInTheDocument());
+
+    await user.click(screen.getByText("仅有效"));
+    await user.click(await screen.findByText("仅剔除"));
+
+    await waitFor(() =>
+      expect(api.getSpectra).toHaveBeenLastCalledWith({
+        classKey: baseClass.class_key,
+        excluded: "excluded",
+        subsetId: undefined,
+        limit: 2000
+      })
+    );
+    expect(await screen.findByRole("button", { name: baseSpectrum.file_name })).toBeInTheDocument();
+  });
+
   it("locks a clicked spectrum, then excludes it from the detail card and can undo the action", async () => {
     const user = userEvent.setup();
     render(<App />);

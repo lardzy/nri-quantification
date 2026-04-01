@@ -305,7 +305,7 @@ function Workspace() {
     const keyword = deferredClassSearch.trim();
     return classes.filter((item) => !keyword || item.class_display_name.includes(keyword));
   }, [classes, deferredClassSearch]);
-  const previewSpectra = useMemo(() => spectra.filter((item) => !item.is_excluded), [spectra]);
+  const previewSpectra = useMemo(() => spectra, [spectra]);
 
   const detailSpectrum = chartInteractionState.lockedSpectrum ?? pendingUndoSpectrum;
   const detailModeLabel = chartInteractionState.lockedSpectrum ? "已锁定" : pendingUndoSpectrum ? "最近操作" : null;
@@ -505,7 +505,14 @@ function Workspace() {
       setChartInteractionState({ hoveredSpectrum: null, lockedSpectrum: null });
       setPendingUndoSpectrum(updated);
       startTransition(() => {
-        setSpectra((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+        setSpectra((current) =>
+          excludedFilter === "active"
+            ? current.filter((item) => item.id !== updated.id)
+            : current.map((item) => (item.id === updated.id ? updated : item))
+        );
+        if (excludedFilter === "active") {
+          setSpectraTotal((current) => Math.max(0, current - 1));
+        }
       });
       await refreshClasses();
       await refreshExcluded();
@@ -929,7 +936,15 @@ function Workspace() {
                     <Spin spinning={loadingSpectra} tip="正在加载光谱数据...">
                       <>
                         {previewSpectra.length === 0 && !loadingSpectra ? (
-                          <Empty description={excludedFilter === "excluded" ? "当前筛选结果均为已剔除光谱，图表中不再显示。" : "当前没有可预览的未剔除光谱。"} />
+                          <Empty
+                            description={
+                              excludedFilter === "excluded"
+                                ? "当前没有可预览的已剔除光谱。"
+                                : excludedFilter === "all"
+                                  ? "当前没有可预览的光谱。"
+                                  : "当前没有可预览的未剔除光谱。"
+                            }
+                          />
                         ) : (
                           <SpectrumChart
                             key={`${selectedClass.class_key}:${excludedFilter}:${activeSubsetId ?? "all"}`}
