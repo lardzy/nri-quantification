@@ -23,6 +23,7 @@ import {
   Switch,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
   message,
   notification
@@ -60,6 +61,14 @@ type PathChooserProps = {
 type ChartInteractionState = {
   hoveredSpectrum: SpectrumItem | null;
   lockedSpectrum: SpectrumItem | null;
+};
+
+type ExportScope = "active" | "excluded" | "all";
+
+const EXPORT_SCOPE_LABELS: Record<ExportScope, string> = {
+  active: "未剔除",
+  excluded: "已剔除",
+  all: "全部"
 };
 
 function PathChooserCard({
@@ -121,6 +130,7 @@ function PathChooserCard({
 
   return (
     <Card
+      size="small"
       title={title}
       extra={
         <Button type="primary" icon={actionIcon} disabled={actionDisabled || !currentPath} onClick={() => void onAction()}>
@@ -164,12 +174,14 @@ function PathChooserCard({
 function DetailCard(props: {
   spectrum: SpectrumItem | null;
   modeLabel: string | null;
+  compact?: boolean;
   onExclude: (spectrum: SpectrumItem) => Promise<void>;
   onRestore: (spectrum: SpectrumItem) => Promise<void>;
 }) {
-  const { spectrum, modeLabel, onExclude, onRestore } = props;
+  const { spectrum, modeLabel, compact = false, onExclude, onRestore } = props;
   return (
     <Card
+      size={compact ? "small" : "default"}
       title="当前光谱"
       extra={
         modeLabel ? (
@@ -184,7 +196,7 @@ function DetailCard(props: {
       ) : (
         <Space direction="vertical" size="middle" style={{ width: "100%" }}>
           <div>
-            <Title level={5} style={{ marginBottom: 6 }}>
+            <Title level={compact ? 5 : 4} style={{ marginBottom: 4 }}>
               {spectrum.file_name}
             </Title>
             <Space wrap>
@@ -193,7 +205,7 @@ function DetailCard(props: {
               <Tag>{spectrum.point_count} 点</Tag>
             </Space>
           </div>
-          <Descriptions column={1} size="small" bordered>
+          <Descriptions column={1} size="small" bordered className={compact ? "detail-descriptions-compact" : undefined}>
             <Descriptions.Item label="成分">{formatSpectrumLabels(spectrum.labels) || "无标签"}</Descriptions.Item>
             <Descriptions.Item label="来源路径">{spectrum.source_path_last_seen}</Descriptions.Item>
             <Descriptions.Item label="设备序列号">
@@ -251,6 +263,7 @@ function Workspace() {
   });
   const [pendingUndoSpectrum, setPendingUndoSpectrum] = useState<SpectrumItem | null>(null);
   const [rightDrawerOpen, setRightDrawerOpen] = useState(false);
+  const [chartResetToken, setChartResetToken] = useState(0);
   const subscriptionsRef = useRef<Map<number, () => void>>(new Map());
 
   const canRender = spectraTotal <= 2000;
@@ -363,87 +376,115 @@ function Workspace() {
   }
 
   async function startImport() {
-    if (!importPath) {
-      messageApi.warning("请先选择导入目录");
-      return;
+    try {
+      if (!importPath) {
+        messageApi.warning("请先选择导入目录");
+        return;
+      }
+      const job = await api.createImportJob(importPath);
+      trackJob(job);
+      messageApi.success("导入任务已创建");
+    } catch (error) {
+      const messageText = String(error);
+      setErrorText(messageText);
+      messageApi.error(`导入任务创建失败：${messageText}`);
     }
-    const job = await api.createImportJob(importPath);
-    trackJob(job);
-    messageApi.success("导入任务已创建");
   }
 
-  async function startExport(scope: "active" | "excluded" | "all") {
-    if (!exportPath) {
-      messageApi.warning("请先选择导出目录");
-      return;
+  async function startExport(scope: ExportScope) {
+    try {
+      if (!exportPath) {
+        messageApi.warning("请先选择导出目录");
+        return;
+      }
+      if (exportSelectedOnly && !selectedClass) {
+        messageApi.warning("请先选择分类，或关闭“仅导出当前选中分类”");
+        return;
+      }
+      const classKeys = exportSelectedOnly && selectedClass ? [selectedClass.class_key] : [];
+      const job = await api.createExportJob(exportPath, scope, classKeys);
+      trackJob(job);
+      messageApi.success(`${EXPORT_SCOPE_LABELS[scope]}光谱导出任务已创建`);
+    } catch (error) {
+      const messageText = String(error);
+      setErrorText(messageText);
+      messageApi.error(`导出任务创建失败：${messageText}`);
     }
-    const classKeys = exportSelectedOnly && selectedClass ? [selectedClass.class_key] : [];
-    const job = await api.createExportJob(exportPath, scope, classKeys);
-    trackJob(job);
-    messageApi.success("导出任务已创建");
   }
 
   async function restoreSpectrumItem(spectrum: SpectrumItem) {
-    const restored = await api.restoreSpectrum(spectrum.id);
-    setPendingUndoSpectrum(null);
-    setHoveredSpectrumId((current) => (current === restored.id ? restored.id : current));
-    if (lockedSpectrumId === restored.id) {
-      setChartInteractionState((current) => ({ ...current, lockedSpectrum: restored }));
+    try {
+      const restored = await api.restoreSpectrum(spectrum.id);
+      setPendingUndoSpectrum(null);
+      setHoveredSpectrumId((current) => (current === restored.id ? restored.id : current));
+      if (lockedSpectrumId === restored.id) {
+        setChartInteractionState((current) => ({ ...current, lockedSpectrum: restored }));
+      }
+      setChartInteractionState((current) => ({
+        hoveredSpectrum: current.hoveredSpectrum?.id === restored.id ? restored : current.hoveredSpectrum,
+        lockedSpectrum: current.lockedSpectrum?.id === restored.id ? restored : current.lockedSpectrum
+      }));
+      await refreshClasses();
+      await refreshExcluded();
+      if (selectedClass) {
+        await loadSpectra(selectedClass, excludedFilter, activeSubsetId);
+      }
+      messageApi.success(`已恢复 ${restored.file_name}`);
+    } catch (error) {
+      const messageText = String(error);
+      setErrorText(messageText);
+      messageApi.error(`恢复失败：${messageText}`);
     }
-    setChartInteractionState((current) => ({
-      hoveredSpectrum: current.hoveredSpectrum?.id === restored.id ? restored : current.hoveredSpectrum,
-      lockedSpectrum: current.lockedSpectrum?.id === restored.id ? restored : current.lockedSpectrum
-    }));
-    await refreshClasses();
-    await refreshExcluded();
-    if (selectedClass) {
-      await loadSpectra(selectedClass, excludedFilter, activeSubsetId);
-    }
-    messageApi.success(`已恢复 ${restored.file_name}`);
   }
 
   async function handleExclude(spectrum: SpectrumItem) {
-    if (spectrum.is_excluded) {
-      return;
-    }
-    const updated = await api.excludeSpectrum(spectrum.id);
-    setLockedSpectrumId(updated.id);
-    setHoveredSpectrumId((current) => (current === updated.id ? updated.id : current));
-    setChartInteractionState((current) => ({
-      hoveredSpectrum: current.hoveredSpectrum?.id === updated.id ? updated : current.hoveredSpectrum,
-      lockedSpectrum: updated
-    }));
-    setPendingUndoSpectrum(updated);
-    startTransition(() => {
-      setSpectra((current) =>
-        current
-          .map((item) => (item.id === updated.id ? updated : item))
-          .filter((item) => (excludedFilter === "active" ? !item.is_excluded : true))
-      );
-      setSpectraTotal((current) => Math.max(0, excludedFilter === "active" ? current - 1 : current));
-    });
-    await refreshClasses();
-    await refreshExcluded();
+    try {
+      if (spectrum.is_excluded) {
+        return;
+      }
+      const updated = await api.excludeSpectrum(spectrum.id);
+      setLockedSpectrumId(updated.id);
+      setHoveredSpectrumId((current) => (current === updated.id ? updated.id : current));
+      setChartInteractionState((current) => ({
+        hoveredSpectrum: current.hoveredSpectrum?.id === updated.id ? updated : current.hoveredSpectrum,
+        lockedSpectrum: updated
+      }));
+      setPendingUndoSpectrum(updated);
+      startTransition(() => {
+        setSpectra((current) =>
+          current
+            .map((item) => (item.id === updated.id ? updated : item))
+            .filter((item) => (excludedFilter === "active" ? !item.is_excluded : true))
+        );
+        setSpectraTotal((current) => Math.max(0, excludedFilter === "active" ? current - 1 : current));
+      });
+      await refreshClasses();
+      await refreshExcluded();
 
-    const notificationKey = `exclude-${updated.id}`;
-    notificationApi.open({
-      key: notificationKey,
-      message: `已剔除 ${updated.file_name}`,
-      description: formatSpectrumLabels(updated.labels) || "无标签",
-      duration: 6,
-      actions: (
-        <Button
-          size="small"
-          type="primary"
-          onClick={() => {
-            notificationApi.destroy(notificationKey);
-            void restoreSpectrumItem(updated);
-          }}
-        >
-          撤销
-        </Button>
-      )
-    });
+      const notificationKey = `exclude-${updated.id}`;
+      notificationApi.open({
+        key: notificationKey,
+        message: `已剔除 ${updated.file_name}`,
+        description: formatSpectrumLabels(updated.labels) || "无标签",
+        duration: 6,
+        actions: (
+          <Button
+            size="small"
+            type="primary"
+            onClick={() => {
+              notificationApi.destroy(notificationKey);
+              void restoreSpectrumItem(updated);
+            }}
+          >
+            撤销
+          </Button>
+        )
+      });
+    } catch (error) {
+      const messageText = String(error);
+      setErrorText(messageText);
+      messageApi.error(`剔除失败：${messageText}`);
+    }
   }
 
   async function handleUndo() {
@@ -454,30 +495,34 @@ function Workspace() {
   }
 
   async function createSubsets() {
-    if (!selectedClass) {
-      messageApi.warning("请先选择分类");
-      return;
+    try {
+      if (!selectedClass) {
+        messageApi.warning("请先选择分类");
+        return;
+      }
+      const payload =
+        subsetMode === "count"
+          ? { mode: "count" as const, parts: Math.max(1, Number(subsetInput) || 1) }
+          : {
+              mode: "ratio" as const,
+              ratios: subsetInput
+                .split(",")
+                .map((item) => Number(item.trim()))
+                .filter((item) => Number.isFinite(item) && item > 0)
+            };
+      const result = await api.createSubsets(selectedClass.class_key, payload);
+      setSubsets(result.subsets);
+      setActiveSubsetId(undefined);
+      messageApi.success(`已生成 ${result.subsets.length} 个子集`);
+    } catch (error) {
+      const messageText = String(error);
+      setErrorText(messageText);
+      messageApi.error(`子集切分失败：${messageText}`);
     }
-    const payload =
-      subsetMode === "count"
-        ? { mode: "count" as const, parts: Math.max(1, Number(subsetInput) || 1) }
-        : {
-            mode: "ratio" as const,
-            ratios: subsetInput
-              .split(",")
-              .map((item) => Number(item.trim()))
-              .filter((item) => Number.isFinite(item) && item > 0)
-          };
-    const result = await api.createSubsets(selectedClass.class_key, payload);
-    setSubsets(result.subsets);
-    setActiveSubsetId(undefined);
-    messageApi.success(`已生成 ${result.subsets.length} 个子集`);
   }
 
   const rightPanel = (
     <div className="workspace-panel-stack">
-      <DetailCard spectrum={detailSpectrum} modeLabel={detailModeLabel} onExclude={handleExclude} onRestore={restoreSpectrumItem} />
-
       <PathChooserCard
         kind="export"
         currentPath={exportPath}
@@ -488,7 +533,7 @@ function Workspace() {
         onAction={() => startExport("active")}
       />
 
-      <Card title="导出选项">
+      <Card title="导出选项" size="small">
         <Space direction="vertical" size="middle" style={{ width: "100%" }}>
           <div className="switch-row">
             <Text>仅导出当前选中分类</Text>
@@ -501,7 +546,7 @@ function Workspace() {
         </Space>
       </Card>
 
-      <Card title="后台任务">
+      <Card title="后台任务" size="small">
         <List
           dataSource={jobs}
           locale={{ emptyText: "暂无任务" }}
@@ -519,7 +564,11 @@ function Workspace() {
                     </Tag>
                   </div>
                   <Progress percent={progress} size="small" />
-                  <Text type="secondary">{job.progress_message}</Text>
+                  <Text type="secondary">
+                    {job.type === "export"
+                      ? `范围：${EXPORT_SCOPE_LABELS[String(job.params.scope) as ExportScope] ?? "未知"}${Array.isArray(job.params.class_keys) && job.params.class_keys.length > 0 ? ` · ${job.params.class_keys.length} 个分类` : " · 全部分类"}`
+                      : job.progress_message}
+                  </Text>
                 </div>
               </List.Item>
             );
@@ -527,19 +576,27 @@ function Workspace() {
         />
       </Card>
 
-      <Card title="最近剔除">
+      <Card title="最近剔除" size="small">
         <List
           dataSource={recentExcluded}
           locale={{ emptyText: "暂无已剔除光谱" }}
           renderItem={(item) => (
             <List.Item
+              className="recent-item"
               actions={[
                 <Button key={`restore-${item.id}`} type="link" icon={<UndoOutlined />} onClick={() => void restoreSpectrumItem(item)}>
                   恢复
                 </Button>
               ]}
             >
-              <List.Item.Meta title={item.file_name} description={item.class_display_name} />
+              <List.Item.Meta
+                title={
+                  <Tooltip title={item.file_name}>
+                    <span className="ellipsis-text">{item.file_name}</span>
+                  </Tooltip>
+                }
+                description={item.class_display_name}
+              />
             </List.Item>
           )}
         />
@@ -629,33 +686,36 @@ function Workspace() {
 
           <Layout>
             <Header className="workspace-header">
-              <div>
-                <Title level={3} style={{ margin: 0 }}>
-                  光谱工作台
-                </Title>
-                <Text type="secondary">悬停预览最近曲线，点击即可剔除，右侧会同步显示完整信息。</Text>
+              <div className="workspace-header-card">
+                <div>
+                  <Title level={4} style={{ margin: 0 }}>
+                    光谱工作台
+                  </Title>
+                  <Text type="secondary">悬停预览最近曲线，点击即可剔除，并在下方查看完整信息。</Text>
+                </div>
+                <Space wrap>
+                  <Tag icon={<BarChartOutlined />}>{selectedClassLabel}</Tag>
+                  {compactRightPanel && (
+                    <Button icon={<InfoCircleOutlined />} onClick={() => setRightDrawerOpen(true)}>
+                      任务与导出
+                    </Button>
+                  )}
+                </Space>
               </div>
-              <Space wrap>
-                <Tag icon={<BarChartOutlined />}>{selectedClassLabel}</Tag>
-                {compactRightPanel && (
-                  <Button icon={<InfoCircleOutlined />} onClick={() => setRightDrawerOpen(true)}>
-                    详情面板
-                  </Button>
-                )}
-              </Space>
             </Header>
 
             <Content className="workspace-content">
-              <Card className="status-strip">
+              <Card className="status-strip" size="small">
                 <div className="status-grid">
-                  <Statistic title="分类数量" value={classes.length} />
-                  <Statistic title="当前分类总量" value={selectedClass?.total_count ?? 0} />
-                  <Statistic title="当前载入曲线" value={spectra.length} />
-                  <Statistic title="最近任务数" value={jobs.length} />
+                  <Statistic title="分类数量" value={classes.length} valueStyle={{ fontSize: 24, lineHeight: 1.1 }} />
+                  <Statistic title="当前分类总量" value={selectedClass?.total_count ?? 0} valueStyle={{ fontSize: 24, lineHeight: 1.1 }} />
+                  <Statistic title="当前载入曲线" value={spectra.length} valueStyle={{ fontSize: 24, lineHeight: 1.1 }} />
+                  <Statistic title="最近任务数" value={jobs.length} valueStyle={{ fontSize: 24, lineHeight: 1.1 }} />
                 </div>
               </Card>
 
               <Card
+                size="small"
                 title="预览控制"
                 extra={
                   <Space wrap>
@@ -684,20 +744,29 @@ function Workspace() {
                 }
               >
                 <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-                  <div className="subset-toolbar">
-                    <Segmented
-                      value={subsetMode}
-                      onChange={(value) => setSubsetMode(value as "count" | "ratio")}
-                      options={[
-                        { label: "按数量切分", value: "count" },
-                        { label: "按比例切分", value: "ratio" }
-                      ]}
-                    />
-                    {subsetMode === "count" ? (
-                      <InputNumber min={1} value={Number(subsetInput) || 1} onChange={(value) => setSubsetInput(String(value ?? 1))} />
-                    ) : (
-                      <Input value={subsetInput} onChange={(event) => setSubsetInput(event.target.value)} placeholder="例如 1,1,1,1" />
-                    )}
+                  <div className="subset-toolbar-inline">
+                    <div className="subset-mode-control">
+                      <Segmented
+                        value={subsetMode}
+                        onChange={(value) => setSubsetMode(value as "count" | "ratio")}
+                        options={[
+                          { label: "按数量切分", value: "count" },
+                          { label: "按比例切分", value: "ratio" }
+                        ]}
+                      />
+                      <div className="subset-input-wrap">
+                        {subsetMode === "count" ? (
+                          <InputNumber
+                            min={1}
+                            style={{ width: "100%" }}
+                            value={Number(subsetInput) || 1}
+                            onChange={(value) => setSubsetInput(String(value ?? 1))}
+                          />
+                        ) : (
+                          <Input value={subsetInput} onChange={(event) => setSubsetInput(event.target.value)} placeholder="例如 1,1,1,1" />
+                        )}
+                      </div>
+                    </div>
                     <Button onClick={() => void createSubsets()} disabled={!selectedClass}>
                       生成子集
                     </Button>
@@ -720,11 +789,15 @@ function Workspace() {
               </Card>
 
               <Card
+                size="small"
                 title="光谱预览"
                 extra={
                   <Space split={<Divider type="vertical" />} size="middle">
                     <Text type="secondary">当前分类：{selectedClassLabel}</Text>
                     <Text type="secondary">总量：{spectraTotal}</Text>
+                    <Button size="small" icon={<ReloadOutlined />} onClick={() => setChartResetToken((current) => current + 1)} disabled={!selectedClass || !canRender}>
+                      恢复默认缩放
+                    </Button>
                   </Space>
                 }
               >
@@ -741,6 +814,7 @@ function Workspace() {
                   <Spin spinning={loadingSpectra} tip="正在加载光谱数据...">
                     <SpectrumChart
                       spectra={spectra}
+                      resetSignal={chartResetToken}
                       hoveredSpectrumId={hoveredSpectrumId}
                       lockedSpectrumId={lockedSpectrumId}
                       onHoverSpectrum={(spectrum) => {
@@ -757,12 +831,14 @@ function Workspace() {
                 )}
               </Card>
 
+              <DetailCard compact spectrum={detailSpectrum} modeLabel={detailModeLabel} onExclude={handleExclude} onRestore={restoreSpectrumItem} />
+
               {errorText && <Alert type="error" showIcon message="前端操作失败" description={errorText} />}
             </Content>
           </Layout>
 
           {!compactRightPanel && (
-            <Sider width={384} className="workspace-sider right-sider">
+            <Sider width={352} className="workspace-sider right-sider">
               {rightPanel}
             </Sider>
           )}

@@ -39,11 +39,13 @@ const baseClass = {
 vi.mock("./SpectrumChart", () => ({
   SpectrumChart: ({
     spectra,
+    resetSignal: _resetSignal,
     onHoverSpectrum,
     onLockSpectrum,
     onExclude
   }: {
     spectra: Array<typeof baseSpectrum>;
+    resetSignal: number;
     onHoverSpectrum: (spectrum: typeof baseSpectrum | null) => void;
     onLockSpectrum: (spectrum: typeof baseSpectrum | null) => void;
     onExclude: (spectrum: typeof baseSpectrum) => void;
@@ -204,5 +206,22 @@ describe("App", () => {
     await user.click(undoButton);
 
     await waitFor(() => expect(api.restoreSpectrum).toHaveBeenCalledWith(baseSpectrum.id));
+  });
+
+  it("creates export jobs with the selected scope", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await waitFor(() => expect(api.getSpectra).toHaveBeenCalled());
+
+    await user.click(await screen.findByRole("button", { name: "导出剔除" }));
+    await waitFor(() =>
+      expect(api.createExportJob).toHaveBeenCalledWith("/workspace/exports", "excluded", [baseClass.class_key])
+    );
+
+    await user.click(await screen.findByRole("button", { name: "导出全部" }));
+    await waitFor(() =>
+      expect(api.createExportJob).toHaveBeenCalledWith("/workspace/exports", "all", [baseClass.class_key])
+    );
   });
 });

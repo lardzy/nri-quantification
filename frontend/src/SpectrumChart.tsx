@@ -13,6 +13,7 @@ type HoverPreview = {
 
 type Props = {
   spectra: SpectrumItem[];
+  resetSignal: number;
   hoveredSpectrumId: number | null;
   lockedSpectrumId: number | null;
   onHoverSpectrum: (spectrum: SpectrumItem | null) => void;
@@ -22,6 +23,7 @@ type Props = {
 
 export function SpectrumChart({
   spectra,
+  resetSignal,
   hoveredSpectrumId,
   lockedSpectrumId,
   onHoverSpectrum,
@@ -37,6 +39,7 @@ export function SpectrumChart({
   const hoverCallbackRef = useRef(onHoverSpectrum);
   const lockCallbackRef = useRef(onLockSpectrum);
   const excludeCallbackRef = useRef(onExclude);
+  const optionRef = useRef<Record<string, unknown> | null>(null);
   const [preview, setPreview] = useState<HoverPreview | null>(null);
 
   useEffect(() => {
@@ -62,19 +65,25 @@ export function SpectrumChart({
       animation: false,
       backgroundColor: "#fcfcfd",
       tooltip: { show: false },
-      grid: { left: 52, right: 24, top: 24, bottom: 48 },
+      grid: { left: 88, right: 32, top: 28, bottom: 88, containLabel: true },
       xAxis: {
         type: "value",
         name: spectra[0]?.axis_unit === "nm" ? "波长 (nm)" : "X",
+        nameLocation: "middle",
+        nameGap: 42,
+        nameTextStyle: { fontWeight: 600, padding: [18, 0, 0, 0] },
         scale: true,
-        axisLabel: { color: "#475467" },
+        axisLabel: { color: "#475467", margin: 12 },
         splitLine: { lineStyle: { color: "rgba(15, 23, 42, 0.08)" } }
       },
       yAxis: {
         type: "value",
         name: "吸光度",
+        nameLocation: "middle",
+        nameGap: 64,
+        nameTextStyle: { fontWeight: 600, padding: [0, 0, 10, 0] },
         scale: true,
-        axisLabel: { color: "#475467" },
+        axisLabel: { color: "#475467", margin: 12 },
         splitLine: { lineStyle: { color: "rgba(15, 23, 42, 0.08)" } }
       },
       dataZoom: [
@@ -205,9 +214,16 @@ export function SpectrumChart({
 
   useEffect(() => {
     if (chartRef.current) {
-      chartRef.current.setOption(option, true);
+      optionRef.current = option as Record<string, unknown>;
+      chartRef.current.setOption(option, { notMerge: false, lazyUpdate: true });
     }
   }, [option]);
+
+  useEffect(() => {
+    if (chartRef.current && optionRef.current) {
+      chartRef.current.setOption(optionRef.current, true);
+    }
+  }, [resetSignal]);
 
   return (
     <div className="chart-shell">

@@ -39,11 +39,19 @@ body {
 
 .workspace-header {
   height: auto;
-  min-height: 88px;
-  padding: 18px 24px;
-  background: rgba(255, 255, 255, 0.7);
+  min-height: 0;
+  padding: 14px 18px 0;
+  background: transparent;
+  border-bottom: none;
+}
+
+.workspace-header-card {
+  width: 100%;
+  padding: 14px 18px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.82);
   backdrop-filter: blur(18px);
-  border-bottom: 1px solid rgba(15, 23, 42, 0.08);
+  border: 1px solid rgba(15, 23, 42, 0.08);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -51,20 +59,33 @@ body {
 }
 
 .workspace-content {
-  padding: 18px;
+  padding: 14px 18px 18px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
 }
 
 .status-strip .ant-card-body {
-  padding: 18px 20px;
+  padding: 12px 16px;
 }
 
 .status-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 16px;
+  gap: 12px;
+}
+
+.status-grid .ant-statistic {
+  padding: 2px 0;
+}
+
+.status-grid .ant-statistic .ant-statistic-title {
+  margin-bottom: 2px;
+  font-size: 12px;
+}
+
+.status-grid .ant-statistic .ant-statistic-content {
+  line-height: 1.1;
 }
 
 .path-current-card {
@@ -121,12 +142,32 @@ body {
   margin-bottom: 8px;
 }
 
-.subset-toolbar,
 .switch-row,
 .job-item {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.subset-toolbar-inline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.subset-mode-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1 1 420px;
+  min-width: 0;
+}
+
+.subset-input-wrap {
+  flex: 0 0 220px;
+  min-width: 180px;
 }
 
 .switch-row {
@@ -151,6 +192,16 @@ body {
   border-radius: 20px;
   background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
   border: 1px solid rgba(15, 23, 42, 0.08);
+}
+
+.detail-descriptions-compact .ant-descriptions-view table {
+  table-layout: fixed;
+}
+
+.detail-descriptions-compact .ant-descriptions-item-label,
+.detail-descriptions-compact .ant-descriptions-item-content {
+  padding-top: 8px !important;
+  padding-bottom: 8px !important;
 }
 
 .chart-hover-card {
@@ -188,6 +239,32 @@ body {
   margin-inline-end: 0;
 }
 
+.recent-item {
+  align-items: flex-start !important;
+}
+
+.recent-item .ant-list-item-meta {
+  min-width: 0;
+}
+
+.recent-item .ant-list-item-action {
+  margin-inline-start: 12px;
+  padding-top: 2px;
+}
+
+.recent-item .ant-list-item-meta-title {
+  margin-bottom: 4px !important;
+}
+
+.ellipsis-text {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
 @media (max-width: 1400px) {
   .status-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -216,11 +293,11 @@ body {
   }
 
   .workspace-header {
-    padding: 16px;
+    padding: 12px 16px 0;
   }
 
   .workspace-content {
-    padding: 16px;
+    padding: 12px 16px 16px;
   }
 
   .chart-surface {
@@ -231,6 +308,17 @@ body {
 @media (max-width: 768px) {
   .status-grid {
     grid-template-columns: 1fr;
+  }
+
+  .workspace-header-card,
+  .subset-mode-control {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .subset-input-wrap {
+    flex-basis: auto;
+    width: 100%;
   }
 
   .chart-surface {
