@@ -21,14 +21,73 @@ class SubsetStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._subsets: dict[str, dict[str, Any]] = {}
+        self._spectrum_index: dict[int, set[str]] = {}
 
     def put(self, subset_id: str, payload: dict[str, Any]) -> None:
         with self._lock:
             self._subsets[subset_id] = payload
+            for spectrum_id in payload.get("spectrum_ids", []):
+                self._spectrum_index.setdefault(int(spectrum_id), set()).add(subset_id)
 
     def get(self, subset_id: str) -> dict[str, Any] | None:
         with self._lock:
             return self._subsets.get(subset_id)
+
+    def get_summary(self, subset_id: str, excluded: str) -> dict[str, Any] | None:
+        with self._lock:
+            payload = self._subsets.get(subset_id)
+            if payload is None:
+                return None
+            axis_counts = payload["axis_summary_by_filter"].get(excluded, {})
+            items = [
+                {
+                    "axis_kind": axis_kind,
+                    "axis_unit": axis_unit,
+                    "count": count,
+                }
+                for (axis_kind, axis_unit), count in sorted(axis_counts.items())
+                if count > 0
+            ]
+            return {
+                "total_count": int(payload["count_by_filter"].get(excluded, 0)),
+                "axis_summary": items,
+                "source": "subset-cache",
+            }
+
+    def adjust_for_exclusion(self, spectrum: Spectrum, excluded: bool) -> None:
+        with self._lock:
+            subset_ids = list(self._spectrum_index.get(int(spectrum.id), set()))
+            if not subset_ids:
+                return
+            axis_key = (spectrum.axis_kind, spectrum.axis_unit)
+            for subset_id in subset_ids:
+                payload = self._subsets.get(subset_id)
+                if payload is None:
+                    continue
+                count_by_filter = payload.get("count_by_filter", {})
+                axis_summary_by_filter = payload.get("axis_summary_by_filter", {})
+                if excluded:
+                    if int(count_by_filter.get("active", 0)) > 0:
+                        count_by_filter["active"] = int(count_by_filter.get("active", 0)) - 1
+                    count_by_filter["excluded"] = int(count_by_filter.get("excluded", 0)) + 1
+                    active_axis = axis_summary_by_filter.setdefault("active", {})
+                    excluded_axis = axis_summary_by_filter.setdefault("excluded", {})
+                    if int(active_axis.get(axis_key, 0)) > 0:
+                        active_axis[axis_key] = int(active_axis.get(axis_key, 0)) - 1
+                        if active_axis[axis_key] <= 0:
+                            active_axis.pop(axis_key, None)
+                    excluded_axis[axis_key] = int(excluded_axis.get(axis_key, 0)) + 1
+                else:
+                    if int(count_by_filter.get("excluded", 0)) > 0:
+                        count_by_filter["excluded"] = int(count_by_filter.get("excluded", 0)) - 1
+                    count_by_filter["active"] = int(count_by_filter.get("active", 0)) + 1
+                    active_axis = axis_summary_by_filter.setdefault("active", {})
+                    excluded_axis = axis_summary_by_filter.setdefault("excluded", {})
+                    active_axis[axis_key] = int(active_axis.get(axis_key, 0)) + 1
+                    if int(excluded_axis.get(axis_key, 0)) > 0:
+                        excluded_axis[axis_key] = int(excluded_axis.get(axis_key, 0)) - 1
+                        if excluded_axis[axis_key] <= 0:
+                            excluded_axis.pop(axis_key, None)
 
 
 class JobManager:
@@ -111,14 +170,15 @@ class JobManager:
         mode: str,
         parts: int | None,
         ratios: list[float] | None,
-        spectrum_ids: list[int],
+        spectra_rows: list[dict[str, Any]],
     ) -> dict[str, Any]:
         import uuid
 
+        spectrum_ids = [int(row["id"]) for row in spectra_rows]
         subsets: list[dict[str, Any]] = []
         if mode == "count":
             chunk_size = max(1, parts or 1)
-            groups = [spectrum_ids[index:index + chunk_size] for index in range(0, len(spectrum_ids), chunk_size)]
+            groups = [spectra_rows[index:index + chunk_size] for index in range(0, len(spectra_rows), chunk_size)]
         else:
             raw_partition_count = parts if parts is not None else int(ratios[0]) if ratios else 1
             partition_count = max(1, raw_partition_count)
@@ -128,17 +188,48 @@ class JobManager:
             cursor = 0
             for index in range(partition_count):
                 size = base_size + (1 if index < remainder else 0)
-                groups.append(spectrum_ids[cursor:cursor + size])
+                groups.append(spectra_rows[cursor:cursor + size])
                 cursor += size
 
-        for index, ids in enumerate(groups, start=1):
-            if not ids:
+        for index, rows in enumerate(groups, start=1):
+            if not rows:
                 continue
             subset_id = uuid.uuid4().hex
-            payload = {"subset_id": subset_id, "class_key": class_key, "index": index, "spectrum_ids": ids}
+            payload = self._build_subset_payload(subset_id=subset_id, class_key=class_key, index=index, spectra_rows=rows)
             self.subsets.put(subset_id, payload)
-            subsets.append({"subset_id": subset_id, "index": index, "count": len(ids)})
+            subsets.append({"subset_id": subset_id, "index": index, "count": len(rows)})
         return {"class_key": class_key, "mode": mode, "subsets": subsets}
+
+    def _build_subset_payload(
+        self,
+        subset_id: str,
+        class_key: str,
+        index: int,
+        spectra_rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        axis_summary_by_filter: dict[str, dict[tuple[str, str], int]] = {
+            "all": {},
+            "active": {},
+            "excluded": {},
+        }
+        count_by_filter = {"all": len(spectra_rows), "active": 0, "excluded": 0}
+        spectrum_ids: list[int] = []
+        for row in spectra_rows:
+            spectrum_id = int(row["id"])
+            axis_key = (str(row["axis_kind"]), str(row["axis_unit"]))
+            spectrum_ids.append(spectrum_id)
+            axis_summary_by_filter["all"][axis_key] = int(axis_summary_by_filter["all"].get(axis_key, 0)) + 1
+            filter_key = "excluded" if bool(row["is_excluded"]) else "active"
+            count_by_filter[filter_key] = int(count_by_filter.get(filter_key, 0)) + 1
+            axis_summary_by_filter[filter_key][axis_key] = int(axis_summary_by_filter[filter_key].get(axis_key, 0)) + 1
+        return {
+            "subset_id": subset_id,
+            "class_key": class_key,
+            "index": index,
+            "spectrum_ids": spectrum_ids,
+            "count_by_filter": count_by_filter,
+            "axis_summary_by_filter": axis_summary_by_filter,
+        }
 
     def _spawn(self, target, job_id: int) -> None:
         thread = threading.Thread(target=target, kwargs={"job_id": job_id}, daemon=True)

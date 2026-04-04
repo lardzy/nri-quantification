@@ -239,18 +239,20 @@ def recompute_class_stats(session: Session, class_keys: Sequence[str] | None = N
     return len(rows)
 
 
-def adjust_class_stats_for_exclusion(session: Session, spectrum: Spectrum, excluded: bool) -> None:
+def adjust_class_stats_for_exclusion(session: Session, spectrum: Spectrum, excluded: bool) -> dict[str, bool]:
     """Atomically adjust cached class counters for a single spectrum exclusion/restoration."""
     delta = 1 if excluded else -1
-    session.execute(
+    updated_at = utcnow()
+    class_result = session.execute(
         update(ClassStat)
         .where(ClassStat.class_key == spectrum.class_key)
         .values(
             active_count=ClassStat.active_count - delta,
             excluded_count=ClassStat.excluded_count + delta,
+            updated_at=updated_at,
         )
     )
-    session.execute(
+    axis_result = session.execute(
         update(ClassAxisStat)
         .where(
             ClassAxisStat.class_key == spectrum.class_key,
@@ -260,8 +262,23 @@ def adjust_class_stats_for_exclusion(session: Session, spectrum: Spectrum, exclu
         .values(
             active_count=ClassAxisStat.active_count - delta,
             excluded_count=ClassAxisStat.excluded_count + delta,
+            updated_at=updated_at,
         )
     )
+    class_updated = bool(getattr(class_result, "rowcount", 0))
+    axis_updated = bool(getattr(axis_result, "rowcount", 0))
+    if not class_updated or not axis_updated:
+        recompute_class_stats(session, [spectrum.class_key])
+        return {
+            "class_updated": class_updated,
+            "axis_updated": axis_updated,
+            "recomputed": True,
+        }
+    return {
+        "class_updated": class_updated,
+        "axis_updated": axis_updated,
+        "recomputed": False,
+    }
 
 
 def spectra_summary(

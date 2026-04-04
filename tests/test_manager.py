@@ -156,6 +156,7 @@ class ManagerTests(unittest.TestCase):
             params={"class_key": class_key, "excluded": "active", "subset_id": ratio_subset_ids[0]},
         ).json()
         self.assertEqual(summary_payload["status"], "ready")
+        self.assertEqual(summary_payload["source"], "subset-cache")
         self.assertEqual(summary_payload["total_count"], 2)
         self.assertEqual(summary_payload["axis_summary"][0]["count"], 2)
 
@@ -174,6 +175,44 @@ class ManagerTests(unittest.TestCase):
         self.assertFalse(restored["is_excluded"])
         classes_after_restore = self.client.get("/api/classes", params={"sort": "name"}).json()["items"]
         self.assertEqual(classes_after_restore[0]["active_count"], 4)
+        self.assertEqual(classes_after_restore[0]["excluded_count"], 0)
+
+    def test_exclude_restore_are_idempotent_and_self_heal_missing_cache_rows(self) -> None:
+        file_name = "ISC_Hadamard 1_聚酯纤维,100.0_ABC123_20240101_120000_1.csv"
+        (self.import_root / file_name).write_text(make_csv_text([("聚酯纤维", 100.0)]), encoding="utf-8")
+
+        job = self.client.post("/api/import-jobs", json={"root_path": str(self.import_root), "recursive": True}).json()
+        self._wait_for_job(job["id"])
+
+        spectra_payload = self.client.get(
+            "/api/spectra",
+            params={"class_key": "聚酯纤维", "excluded": "active", "limit": 2000},
+        ).json()
+        spectrum_id = spectra_payload["items"][0]["id"]
+
+        with session_scope(self.client.app.state.session_factory) as session:
+            session.query(ClassStat).delete()
+            session.query(ClassAxisStat).delete()
+
+        first_exclude = self.client.post(f"/api/spectra/{spectrum_id}/exclude").json()
+        second_exclude = self.client.post(f"/api/spectra/{spectrum_id}/exclude").json()
+        self.assertTrue(first_exclude["is_excluded"])
+        self.assertTrue(second_exclude["is_excluded"])
+
+        classes_after_exclude = self.client.get("/api/classes", params={"sort": "name"}).json()["items"]
+        self.assertEqual(classes_after_exclude[0]["active_count"], 0)
+        self.assertEqual(classes_after_exclude[0]["excluded_count"], 1)
+        with session_scope(self.client.app.state.session_factory) as session:
+            self.assertEqual(session.query(ClassStat).count(), 1)
+            self.assertEqual(session.query(ClassAxisStat).count(), 1)
+
+        first_restore = self.client.post(f"/api/spectra/{spectrum_id}/restore").json()
+        second_restore = self.client.post(f"/api/spectra/{spectrum_id}/restore").json()
+        self.assertFalse(first_restore["is_excluded"])
+        self.assertFalse(second_restore["is_excluded"])
+
+        classes_after_restore = self.client.get("/api/classes", params={"sort": "name"}).json()["items"]
+        self.assertEqual(classes_after_restore[0]["active_count"], 1)
         self.assertEqual(classes_after_restore[0]["excluded_count"], 0)
 
     def test_reimport_skips_existing_file_names(self) -> None:

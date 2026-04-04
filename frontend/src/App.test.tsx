@@ -328,6 +328,28 @@ describe("App", () => {
     await waitFor(() => expect(api.excludeSpectrum).toHaveBeenCalledWith(baseSpectrum.id));
   });
 
+  it("updates the current preview locally after exclude and restore without refetching detail data", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await waitFor(() => expect(api.getSpectra).toHaveBeenCalled());
+    const initialDetailCalls = vi.mocked(api.getSpectra).mock.calls.length;
+
+    await user.click(await screen.findByRole("button", { name: `quick-exclude-${baseSpectrum.file_name}` }));
+    await waitFor(() => expect(api.excludeSpectrum).toHaveBeenCalledWith(baseSpectrum.id));
+    expect(vi.mocked(api.getSpectra).mock.calls.length).toBe(initialDetailCalls);
+
+    const undoButton = (await screen.findAllByRole("button", { name: "撤销最近剔除" })).find((button) => !button.hasAttribute("disabled"));
+    expect(undoButton).toBeDefined();
+    if (!undoButton) {
+      throw new Error("undo button not found");
+    }
+    await user.click(undoButton);
+
+    await waitFor(() => expect(api.restoreSpectrum).toHaveBeenCalledWith(baseSpectrum.id));
+    expect(vi.mocked(api.getSpectra).mock.calls.length).toBe(initialDetailCalls);
+  });
+
   it("shows excluded spectra again when the preview filter switches to only excluded", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -369,6 +391,20 @@ describe("App", () => {
     expect(screen.getByText(/正在初始化分类索引/)).toBeInTheDocument();
   });
 
+  it("keeps the loading shell visible instead of flashing the empty preview state", async () => {
+    vi.mocked(api.getSpectra).mockImplementationOnce(
+      async () =>
+        new Promise(() => {
+          // keep detail loading pending so the preview stays in loading state
+        })
+    );
+
+    render(<App />);
+
+    await screen.findByText("波数 (cm^-1) (1)");
+    expect(screen.queryByText(/没有可预览/)).not.toBeInTheDocument();
+  });
+
   it("short-circuits oversized axis previews before requesting detail data", async () => {
     vi.mocked(api.getSpectraSummary).mockImplementationOnce(async ({ classKey }) => {
       if (classKey !== baseClass.class_key) {
@@ -389,7 +425,7 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(await screen.findByText(/超过 2000 条渲染上限/)).toBeInTheDocument();
+    expect(await screen.findByText("当前轴类型超过渲染上限")).toBeInTheDocument();
     expect(api.getSpectra).not.toHaveBeenCalled();
   });
 
@@ -397,7 +433,6 @@ describe("App", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await waitFor(() => expect(api.getSpectra).toHaveBeenCalled());
     await user.click(await screen.findByText("波数 (cm^-1) (1)"));
     const curveButton = await screen.findByRole("button", { name: fourierSpectrum.file_name });
     await user.click(curveButton);

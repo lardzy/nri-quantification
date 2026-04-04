@@ -252,6 +252,14 @@ body {
   margin-bottom: 12px;
 }
 
+.preview-loading-shell {
+  min-height: 420px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 16px;
+}
+
 .current-class-pill {
   max-width: 280px;
   overflow: hidden;

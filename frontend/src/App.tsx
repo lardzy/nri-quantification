@@ -61,10 +61,15 @@ type PathChooserProps = {
 type ExportScope = "active" | "excluded" | "all";
 
 type PreviewLoadState = {
-  active: boolean;
   percent: number;
   message: string;
 };
+
+type PreviewState = "idle" | "loading-summary" | "loading-detail" | "ready" | "empty" | "over-limit" | "error";
+
+type SpectraResponse = Awaited<ReturnType<typeof api.getSpectra>>;
+
+const PREVIEW_LOADING_DELAY_MS = 200;
 
 const EXPORT_SCOPE_LABELS: Record<ExportScope, string> = {
   active: "未剔除",
@@ -88,6 +93,19 @@ function pickPreferredAxisKind(summary: AxisSummary[]): AxisKind | undefined {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
+}
+
+function getSummaryCacheKey(classKey: string, excluded: "active" | "excluded" | "all", subsetId?: string) {
+  return `${classKey}::${excluded}::${subsetId ?? "__all__"}`;
+}
+
+function getDetailCacheKey(
+  classKey: string,
+  excluded: "active" | "excluded" | "all",
+  subsetId: string | undefined,
+  axisKind: AxisKind
+) {
+  return `${getSummaryCacheKey(classKey, excluded, subsetId)}::${axisKind}`;
 }
 
 function useViewportWidth() {
@@ -330,7 +348,9 @@ function Workspace() {
   const [axisSummary, setAxisSummary] = useState<AxisSummary[]>([]);
   const [selectedAxisKind, setSelectedAxisKind] = useState<AxisKind | undefined>();
   const [spectraTotal, setSpectraTotal] = useState(0);
-  const [previewLoad, setPreviewLoad] = useState<PreviewLoadState>({ active: false, percent: 0, message: "" });
+  const [previewState, setPreviewState] = useState<PreviewState>("idle");
+  const [previewLoad, setPreviewLoad] = useState<PreviewLoadState>({ percent: 0, message: "" });
+  const [loadingIndicatorVisible, setLoadingIndicatorVisible] = useState(false);
   const [previewLimitMessage, setPreviewLimitMessage] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [exportSelectedOnly, setExportSelectedOnly] = useState(true);
@@ -344,7 +364,10 @@ function Workspace() {
   const summaryAbortRef = useRef<AbortController | null>(null);
   const detailAbortRef = useRef<AbortController | null>(null);
   const pollTimeoutRef = useRef<number | null>(null);
+  const loadingIndicatorTimerRef = useRef<number | null>(null);
   const previewTokenRef = useRef(0);
+  const summaryCacheRef = useRef<Map<string, LoadingMeta & { total_count: number; axis_summary: AxisSummary[] }>>(new Map());
+  const detailCacheRef = useRef<Map<string, SpectraResponse>>(new Map());
 
   const filteredClasses = useMemo(() => {
     const keyword = deferredClassSearch.trim();
@@ -358,6 +381,7 @@ function Workspace() {
     : null;
   const currentAxisCount = selectedAxisSummary?.count ?? 0;
   const canRender = currentAxisCount <= 2000;
+  const isPreviewLoading = previewState === "loading-summary" || previewState === "loading-detail";
   const chartDensityMode = previewSpectra.length > 800 ? "dense" : previewSpectra.length > 200 ? "medium" : "full";
   const detailSpectrum = lockedSpectrum ?? pendingUndoSpectrum;
   const detailModeLabel = lockedSpectrum ? "已锁定" : pendingUndoSpectrum ? "最近操作" : null;
@@ -374,14 +398,118 @@ function Workspace() {
     detailAbortRef.current = null;
   }
 
-  function clearPreviewState(resetAxisSelection: boolean) {
+  function clearPreviewLoadingIndicator() {
+    if (loadingIndicatorTimerRef.current !== null) {
+      window.clearTimeout(loadingIndicatorTimerRef.current);
+      loadingIndicatorTimerRef.current = null;
+    }
+    setLoadingIndicatorVisible(false);
+  }
+
+  function beginPreviewLoading(nextState: Extract<PreviewState, "loading-summary" | "loading-detail">, percent: number, message: string) {
+    clearPreviewLoadingIndicator();
+    setPreviewState(nextState);
+    setPreviewLoad({ percent, message });
+    loadingIndicatorTimerRef.current = window.setTimeout(() => {
+      setLoadingIndicatorVisible(true);
+    }, PREVIEW_LOADING_DELAY_MS);
+  }
+
+  function updatePreviewLoading(nextState: Extract<PreviewState, "loading-summary" | "loading-detail">, percent: number, message: string) {
+    setPreviewState(nextState);
+    setPreviewLoad({ percent, message });
+  }
+
+  function finishPreviewLoading(nextState: Exclude<PreviewState, "loading-summary" | "loading-detail">) {
+    clearPreviewLoadingIndicator();
+    setPreviewState(nextState);
+    setPreviewLoad({ percent: 0, message: "" });
+  }
+
+  function applySummaryPayload(
+    data: LoadingMeta & { total_count: number; axis_summary: AxisSummary[] },
+    preferredAxisKind?: AxisKind
+  ) {
+    const nextAxisSummary = sortAxisSummary(data.axis_summary);
+    const nextSelectedAxisKind =
+      preferredAxisKind && nextAxisSummary.some((item) => item.axis_kind === preferredAxisKind)
+        ? preferredAxisKind
+        : pickPreferredAxisKind(nextAxisSummary);
+    startTransition(() => {
+      setAxisSummary(nextAxisSummary);
+      setSelectedAxisKind(nextSelectedAxisKind);
+      setSpectraTotal(data.total_count);
+    });
+    return { nextAxisSummary, nextSelectedAxisKind };
+  }
+
+  function invalidatePreviewCachesForClass(classKey: string, keepKeys?: { summaryKey?: string; detailKey?: string }) {
+    for (const key of Array.from(summaryCacheRef.current.keys())) {
+      if (key.startsWith(`${classKey}::`) && key !== keepKeys?.summaryKey) {
+        summaryCacheRef.current.delete(key);
+      }
+    }
+    for (const key of Array.from(detailCacheRef.current.keys())) {
+      if (key.startsWith(`${classKey}::`) && key !== keepKeys?.detailKey) {
+        detailCacheRef.current.delete(key);
+      }
+    }
+  }
+
+  function patchCurrentSummaryCache(nextTotal: number, nextAxisSummary: AxisSummary[]) {
+    if (!selectedClass) {
+      return;
+    }
+    summaryCacheRef.current.set(getSummaryCacheKey(selectedClass.class_key, excludedFilter, activeSubsetId), {
+      status: "ready",
+      progress_message: null,
+      total_count: nextTotal,
+      axis_summary: nextAxisSummary
+    });
+  }
+
+  function patchCurrentDetailCache(nextItems: SpectrumItem[], nextTotal: number, nextAxisSummary: AxisSummary[]) {
+    if (!selectedClass || !selectedAxisKind) {
+      return;
+    }
+    const detailKey = getDetailCacheKey(selectedClass.class_key, excludedFilter, activeSubsetId, selectedAxisKind);
+    if (!nextAxisSummary.some((item) => item.axis_kind === selectedAxisKind)) {
+      detailCacheRef.current.delete(detailKey);
+      return;
+    }
+    detailCacheRef.current.set(detailKey, {
+      items: nextItems,
+      count: nextTotal,
+      limit: 2000,
+      axis_summary: nextAxisSummary
+    });
+  }
+
+  function applyPreviewTargetReset(resetAxisSelection: boolean) {
     cancelPreviewRequests();
+    clearPreviewLoadingIndicator();
     previewTokenRef.current += 1;
     setSpectra([]);
     setSpectraTotal(0);
-    setPreviewLoad({ active: false, percent: 0, message: "" });
     setPreviewLimitMessage(null);
     setLockedSpectrum(null);
+    setPreviewState(resetAxisSelection ? "loading-summary" : "loading-detail");
+    if (resetAxisSelection) {
+      setAxisSummary([]);
+      setSelectedAxisKind(undefined);
+    }
+  }
+
+  function clearPreviewState(resetAxisSelection: boolean) {
+    cancelPreviewRequests();
+    clearPreviewLoadingIndicator();
+    previewTokenRef.current += 1;
+    setSpectra([]);
+    setSpectraTotal(0);
+    setPreviewLoad({ percent: 0, message: "" });
+    setPreviewLimitMessage(null);
+    setLockedSpectrum(null);
+    setPreviewState("idle");
     if (resetAxisSelection) {
       setAxisSummary([]);
       setSelectedAxisKind(undefined);
@@ -447,13 +575,26 @@ function Workspace() {
     targetClass: SpectrumClass,
     targetFilter: "active" | "excluded" | "all",
     subsetId: string | undefined,
-    preferredAxisKind?: AxisKind
+    preferredAxisKind?: AxisKind,
+    options?: { bypassCache?: boolean; showLoading?: boolean }
   ) {
     cancelPreviewRequests();
+    const summaryKey = getSummaryCacheKey(targetClass.class_key, targetFilter, subsetId);
+    const cached = !options?.bypassCache ? summaryCacheRef.current.get(summaryKey) : undefined;
+    if (cached) {
+      const { nextAxisSummary } = applySummaryPayload(cached, preferredAxisKind);
+      setPreviewLimitMessage(null);
+      if (nextAxisSummary.length === 0) {
+        finishPreviewLoading("empty");
+      }
+      return;
+    }
     const controller = new AbortController();
     summaryAbortRef.current = controller;
     const previewToken = previewTokenRef.current;
-    setPreviewLoad({ active: true, percent: 20, message: "正在查询分类摘要..." });
+    if (options?.showLoading !== false) {
+      beginPreviewLoading("loading-summary", 20, "正在查询分类摘要...");
+    }
     setPreviewLimitMessage(null);
     try {
       const data = await api.getSpectraSummary(
@@ -467,29 +608,17 @@ function Workspace() {
       if (previewToken !== previewTokenRef.current) {
         return;
       }
-      const nextAxisSummary = sortAxisSummary(data.axis_summary);
-      const nextSelectedAxisKind =
-        preferredAxisKind && nextAxisSummary.some((item) => item.axis_kind === preferredAxisKind)
-          ? preferredAxisKind
-          : pickPreferredAxisKind(nextAxisSummary);
-      startTransition(() => {
-        setAxisSummary(nextAxisSummary);
-        setSelectedAxisKind(nextSelectedAxisKind);
-        setSpectraTotal(data.total_count);
-      });
+      summaryCacheRef.current.set(summaryKey, data);
+      const { nextAxisSummary } = applySummaryPayload(data, preferredAxisKind);
 
       if (nextAxisSummary.length === 0) {
-        setPreviewLoad({ active: false, percent: 100, message: "" });
+        finishPreviewLoading("empty");
         return;
       }
-      setPreviewLoad({
-        active: true,
-        percent: 50,
-        message: data.progress_message || "摘要分析完成，正在准备光谱明细..."
-      });
+      updatePreviewLoading("loading-detail", 50, data.progress_message || "摘要分析完成，正在准备光谱明细...");
     } catch (error) {
       if (!isAbortError(error)) {
-        setPreviewLoad({ active: false, percent: 0, message: "" });
+        finishPreviewLoading("error");
         setErrorText(String(error));
       }
     } finally {
@@ -503,12 +632,22 @@ function Workspace() {
     targetClass: SpectrumClass,
     targetFilter: "active" | "excluded" | "all",
     subsetId: string | undefined,
-    axisKind: AxisKind
+    axisKind: AxisKind,
+    options?: { bypassCache?: boolean; showLoading?: boolean }
   ) {
     detailAbortRef.current?.abort();
+    const detailKey = getDetailCacheKey(targetClass.class_key, targetFilter, subsetId, axisKind);
+    const cached = !options?.bypassCache ? detailCacheRef.current.get(detailKey) : undefined;
+    if (cached) {
+      startTransition(() => setSpectra(cached.items));
+      finishPreviewLoading(cached.items.length > 0 ? "ready" : "empty");
+      return;
+    }
     const controller = new AbortController();
     detailAbortRef.current = controller;
-    setPreviewLoad({ active: true, percent: 60, message: "正在读取光谱明细..." });
+    if (options?.showLoading !== false) {
+      beginPreviewLoading("loading-detail", 60, "正在读取光谱明细...");
+    }
     try {
       const data = await api.getSpectra(
         {
@@ -520,11 +659,12 @@ function Workspace() {
         },
         { signal: controller.signal }
       );
+      detailCacheRef.current.set(detailKey, data);
       startTransition(() => setSpectra(data.items));
-      setPreviewLoad({ active: false, percent: 100, message: "" });
+      finishPreviewLoading(data.items.length > 0 ? "ready" : "empty");
     } catch (error) {
       if (!isAbortError(error)) {
-        setPreviewLoad({ active: false, percent: 0, message: "" });
+        finishPreviewLoading("error");
         setErrorText(String(error));
       }
     } finally {
@@ -534,12 +674,12 @@ function Workspace() {
     }
   }
 
-  async function reloadPreview(preferredAxisKind?: AxisKind) {
+  async function reloadPreview(preferredAxisKind?: AxisKind, options?: { bypassCache?: boolean; showLoading?: boolean }) {
     if (!selectedClass || isScreenTooSmall) {
       return;
     }
-    clearPreviewState(true);
-    await loadPreviewSummary(selectedClass, excludedFilter, activeSubsetId, preferredAxisKind);
+    applyPreviewTargetReset(true);
+    await loadPreviewSummary(selectedClass, excludedFilter, activeSubsetId, preferredAxisKind, options);
   }
 
   function trackJob(job: JobItem) {
@@ -595,14 +735,113 @@ function Workspace() {
     }
   }
 
+  function patchClassCountsLocally(classKey: string, activeDelta: number, excludedDelta: number) {
+    startTransition(() => {
+      setClasses((current) =>
+        current.map((item) =>
+          item.class_key === classKey
+            ? {
+                ...item,
+                active_count: Math.max(0, item.active_count + activeDelta),
+                excluded_count: Math.max(0, item.excluded_count + excludedDelta)
+              }
+            : item
+        )
+      );
+      setSelectedClass((current) =>
+        current && current.class_key === classKey
+          ? {
+              ...current,
+              active_count: Math.max(0, current.active_count + activeDelta),
+              excluded_count: Math.max(0, current.excluded_count + excludedDelta)
+            }
+          : current
+      );
+    });
+  }
+
+  function patchAxisSummaryForCurrentView(currentSummary: AxisSummary[], spectrum: SpectrumItem, delta: number) {
+    if (excludedFilter === "all") {
+      return currentSummary;
+    }
+    const nextMap = new Map(currentSummary.map((item) => [`${item.axis_kind}::${item.axis_unit}`, { ...item }]));
+    const key = `${spectrum.axis_kind}::${spectrum.axis_unit}`;
+    const currentItem = nextMap.get(key);
+    if (currentItem) {
+      currentItem.count += delta;
+      if (currentItem.count <= 0) {
+        nextMap.delete(key);
+      } else {
+        nextMap.set(key, currentItem);
+      }
+    } else if (delta > 0) {
+      nextMap.set(key, { axis_kind: spectrum.axis_kind as AxisKind, axis_unit: spectrum.axis_unit, count: delta });
+    }
+    return sortAxisSummary(Array.from(nextMap.values()).filter((item) => item.count > 0));
+  }
+
+  function sortSpectraByFileName(items: SpectrumItem[]) {
+    return [...items].sort((left, right) => left.file_name.localeCompare(right.file_name, "zh-Hans-CN"));
+  }
+
   async function restoreSpectrumItem(spectrum: SpectrumItem) {
     try {
       const restored = await api.restoreSpectrum(spectrum.id);
       setPendingUndoSpectrum(null);
       setLockedSpectrum((current) => (current?.id === restored.id ? restored : current));
-      await refreshClasses({ silent: true });
-      await refreshExcluded();
-      await reloadPreview(selectedAxisKind);
+      setRecentExcluded((current) => current.filter((item) => item.id !== restored.id));
+      patchClassCountsLocally(restored.class_key, 1, -1);
+
+      let nextSpectra = spectra;
+      let nextAxisSummary = axisSummary;
+      let nextTotal = spectraTotal;
+      let nextPreviewState = previewState;
+      const affectsCurrentClass = selectedClass?.class_key === restored.class_key;
+      const isVisibleInCurrentView = spectra.some((item) => item.id === restored.id);
+      const canInsertIntoCurrentActiveView =
+        affectsCurrentClass &&
+        excludedFilter === "active" &&
+        !activeSubsetId &&
+        (!selectedAxisKind || selectedAxisKind === restored.axis_kind);
+
+      if (affectsCurrentClass) {
+        if (excludedFilter === "excluded" && isVisibleInCurrentView) {
+          nextSpectra = spectra.filter((item) => item.id !== restored.id);
+          nextAxisSummary = patchAxisSummaryForCurrentView(axisSummary, restored, -1);
+          nextTotal = Math.max(0, spectraTotal - 1);
+        } else if (excludedFilter === "all" && isVisibleInCurrentView) {
+          nextSpectra = spectra.map((item) => (item.id === restored.id ? restored : item));
+        } else if (canInsertIntoCurrentActiveView) {
+          nextSpectra = sortSpectraByFileName([...spectra.filter((item) => item.id !== restored.id), restored]);
+          nextAxisSummary = patchAxisSummaryForCurrentView(axisSummary, restored, 1);
+          nextTotal = spectraTotal + 1;
+        }
+
+        if (nextPreviewState !== "over-limit" && nextPreviewState !== "error") {
+          const hasAlternativeAxis =
+            nextSpectra.length === 0 &&
+            nextAxisSummary.length > 0 &&
+            (!!selectedAxisKind && !nextAxisSummary.some((item) => item.axis_kind === selectedAxisKind));
+          nextPreviewState = hasAlternativeAxis ? "loading-detail" : nextSpectra.length > 0 ? "ready" : "empty";
+        }
+        startTransition(() => {
+          setSpectra(nextSpectra);
+          setAxisSummary(nextAxisSummary);
+          setSpectraTotal(nextTotal);
+          setPreviewState(nextPreviewState);
+        });
+        patchCurrentSummaryCache(nextTotal, nextAxisSummary);
+        patchCurrentDetailCache(nextSpectra, nextTotal, nextAxisSummary);
+        invalidatePreviewCachesForClass(restored.class_key, {
+          summaryKey: getSummaryCacheKey(restored.class_key, excludedFilter, activeSubsetId),
+          detailKey:
+            selectedAxisKind && selectedClass
+              ? getDetailCacheKey(restored.class_key, excludedFilter, activeSubsetId, selectedAxisKind)
+              : undefined
+        });
+      } else {
+        invalidatePreviewCachesForClass(restored.class_key);
+      }
       messageApi.success(`已恢复 ${restored.file_name}`);
     } catch (error) {
       const messageText = String(error);
@@ -619,16 +858,48 @@ function Workspace() {
       const updated = await api.excludeSpectrum(spectrum.id);
       setLockedSpectrum(null);
       setPendingUndoSpectrum(updated);
-      startTransition(() => {
-        setSpectra((current) =>
-          excludedFilter === "active"
-            ? current.filter((item) => item.id !== updated.id)
-            : current.map((item) => (item.id === updated.id ? updated : item))
-        );
-      });
-      await refreshClasses({ silent: true });
-      await refreshExcluded();
-      await reloadPreview(selectedAxisKind);
+      setRecentExcluded((current) => [updated, ...current.filter((item) => item.id !== updated.id)].slice(0, 50));
+      patchClassCountsLocally(updated.class_key, -1, 1);
+
+      let nextSpectra = spectra;
+      let nextAxisSummary = axisSummary;
+      let nextTotal = spectraTotal;
+      let nextPreviewState = previewState;
+      const affectsCurrentClass = selectedClass?.class_key === updated.class_key;
+      if (affectsCurrentClass) {
+        if (excludedFilter === "active") {
+          nextSpectra = spectra.filter((item) => item.id !== updated.id);
+          nextAxisSummary = patchAxisSummaryForCurrentView(axisSummary, updated, -1);
+          nextTotal = Math.max(0, spectraTotal - 1);
+        } else if (excludedFilter === "all" || excludedFilter === "excluded") {
+          nextSpectra = spectra.map((item) => (item.id === updated.id ? updated : item));
+        }
+
+        if (nextPreviewState !== "over-limit" && nextPreviewState !== "error") {
+          const hasAlternativeAxis =
+            nextSpectra.length === 0 &&
+            nextAxisSummary.length > 0 &&
+            (!!selectedAxisKind && !nextAxisSummary.some((item) => item.axis_kind === selectedAxisKind));
+          nextPreviewState = hasAlternativeAxis ? "loading-detail" : nextSpectra.length > 0 ? "ready" : "empty";
+        }
+        startTransition(() => {
+          setSpectra(nextSpectra);
+          setAxisSummary(nextAxisSummary);
+          setSpectraTotal(nextTotal);
+          setPreviewState(nextPreviewState);
+        });
+        patchCurrentSummaryCache(nextTotal, nextAxisSummary);
+        patchCurrentDetailCache(nextSpectra, nextTotal, nextAxisSummary);
+        invalidatePreviewCachesForClass(updated.class_key, {
+          summaryKey: getSummaryCacheKey(updated.class_key, excludedFilter, activeSubsetId),
+          detailKey:
+            selectedAxisKind && selectedClass
+              ? getDetailCacheKey(updated.class_key, excludedFilter, activeSubsetId, selectedAxisKind)
+              : undefined
+        });
+      } else {
+        invalidatePreviewCachesForClass(updated.class_key);
+      }
 
       const notificationKey = `exclude-${updated.id}`;
       notificationApi.open({
@@ -712,6 +983,7 @@ function Workspace() {
     return () => {
       cancelClassRequest();
       cancelPreviewRequests();
+      clearPreviewLoadingIndicator();
       if (pollTimeoutRef.current !== null) {
         window.clearTimeout(pollTimeoutRef.current);
       }
@@ -744,8 +1016,9 @@ function Workspace() {
     if (isScreenTooSmall) {
       return;
     }
-    clearPreviewState(true);
+    applyPreviewTargetReset(true);
     if (!selectedClass) {
+      setPreviewState("idle");
       return;
     }
     void loadPreviewSummary(selectedClass, excludedFilter, activeSubsetId);
@@ -759,17 +1032,26 @@ function Workspace() {
     if (!nextAxisSummary) {
       return;
     }
-    setSpectra([]);
     if (nextAxisSummary.count > 2000) {
-      setPreviewLoad({ active: false, percent: 50, message: "" });
+      setSpectra([]);
       setPreviewLimitMessage(
         `当前${getAxisDisplayLabel(nextAxisSummary.axis_kind, nextAxisSummary.axis_unit)}共有 ${nextAxisSummary.count} 条，超过 2000 条渲染上限，请先生成子集。`
       );
+      finishPreviewLoading("over-limit");
       return;
     }
     setPreviewLimitMessage(null);
     void loadPreviewDetail(selectedClass, excludedFilter, activeSubsetId, selectedAxisKind);
   }, [activeSubsetId, axisSummary, excludedFilter, isScreenTooSmall, selectedAxisKind, selectedClass]);
+
+  useEffect(() => {
+    if (!selectedAxisKind) {
+      return;
+    }
+    if (!axisSummary.some((item) => item.axis_kind === selectedAxisKind)) {
+      setSelectedAxisKind(pickPreferredAxisKind(axisSummary));
+    }
+  }, [axisSummary, selectedAxisKind]);
 
   useEffect(() => {
     setLockedSpectrum((current) => {
@@ -1052,7 +1334,7 @@ function Workspace() {
                       <Button
                         icon={<ReloadOutlined />}
                         disabled={!selectedClass}
-                        onClick={() => void reloadPreview(selectedAxisKind)}
+                        onClick={() => void reloadPreview(selectedAxisKind, { bypassCache: true })}
                       >
                         刷新
                       </Button>
@@ -1148,13 +1430,18 @@ function Workspace() {
                       />
                     </div>
                   )}
-                  {selectedClass && previewLoad.active && (
-                    <div className="preview-progress-wrap">
-                      <Progress percent={previewLoad.percent} status="active" />
-                      <Text type="secondary">{previewLoad.message}</Text>
+                  {selectedClass && isPreviewLoading && (
+                    <div className="preview-loading-shell">
+                      <Skeleton active title={false} paragraph={{ rows: 7 }} />
+                      {loadingIndicatorVisible && (
+                        <div className="preview-progress-wrap">
+                          <Progress percent={previewLoad.percent} status="active" />
+                          <Text type="secondary">{previewLoad.message}</Text>
+                        </div>
+                      )}
                     </div>
                   )}
-                  {selectedClass && chartDensityMode === "medium" && canRender && previewSpectra.length > 0 && (
+                  {selectedClass && previewState === "ready" && chartDensityMode === "medium" && canRender && previewSpectra.length > 0 && (
                     <Alert
                       type="info"
                       showIcon
@@ -1162,7 +1449,7 @@ function Workspace() {
                       description="当前曲线较多，悬停命中已节流优化，点击锁定与删除仍可正常使用。"
                     />
                   )}
-                  {selectedClass && chartDensityMode === "dense" && canRender && previewSpectra.length > 0 && (
+                  {selectedClass && previewState === "ready" && chartDensityMode === "dense" && canRender && previewSpectra.length > 0 && (
                     <Alert
                       type="warning"
                       showIcon
@@ -1170,7 +1457,7 @@ function Workspace() {
                       description="当前曲线超过 800 条，已关闭悬停预览和悬停高亮，以保证缩放、平移和点击操作流畅。"
                     />
                   )}
-                  {selectedClass && !canRender && previewLimitMessage && (
+                  {selectedClass && previewState === "over-limit" && previewLimitMessage && (
                     <Alert
                       type="warning"
                       showIcon
@@ -1178,30 +1465,27 @@ function Workspace() {
                       description={previewLimitMessage}
                     />
                   )}
-                  {selectedClass && canRender && (
-                    <>
-                      {previewSpectra.length === 0 && !previewLoad.active ? (
-                        <Empty
-                          description={
-                            excludedFilter === "excluded"
-                              ? `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的已剔除光谱。`
-                              : excludedFilter === "all"
-                                ? `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的光谱。`
-                                : `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的未剔除光谱。`
-                          }
-                        />
-                      ) : (
-                        <SpectrumChart
-                          key={`${selectedClass.class_key}:${excludedFilter}:${selectedAxisKind ?? "all"}:${activeSubsetId ?? "all"}`}
-                          spectra={previewSpectra}
-                          resetSignal={chartResetToken}
-                          lockedSpectrumId={lockedSpectrum?.id ?? null}
-                          interactionMode={chartDensityMode}
-                          onLockSpectrum={setLockedSpectrum}
-                          onQuickExclude={(spectrum) => void handleExclude(spectrum)}
-                        />
-                      )}
-                    </>
+                  {selectedClass && previewState === "empty" && (
+                    <Empty
+                      description={
+                        excludedFilter === "excluded"
+                          ? `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的已剔除光谱。`
+                          : excludedFilter === "all"
+                            ? `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的光谱。`
+                            : `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的未剔除光谱。`
+                      }
+                    />
+                  )}
+                  {selectedClass && previewState === "ready" && canRender && (
+                    <SpectrumChart
+                      key={`${selectedClass.class_key}:${excludedFilter}:${selectedAxisKind ?? "all"}:${activeSubsetId ?? "all"}`}
+                      spectra={previewSpectra}
+                      resetSignal={chartResetToken}
+                      lockedSpectrumId={lockedSpectrum?.id ?? null}
+                      interactionMode={chartDensityMode}
+                      onLockSpectrum={setLockedSpectrum}
+                      onQuickExclude={(spectrum) => void handleExclude(spectrum)}
+                    />
                   )}
                 </Card>
 

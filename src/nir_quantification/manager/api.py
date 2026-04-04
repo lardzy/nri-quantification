@@ -157,13 +157,13 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
         subset_id: str | None = None,
         session: Session = Depends(get_session),
     ) -> dict:
-        subset_spectrum_ids: list[int] | None = None
         if subset_id:
-            subset = job_manager.subsets.get(subset_id)
-            if subset is None:
+            subset_summary = job_manager.subsets.get_summary(subset_id, excluded)
+            if subset_summary is None:
                 raise HTTPException(status_code=404, detail="subset not found")
-            subset_spectrum_ids = list(subset["spectrum_ids"])
-        payload = spectra_summary(session, class_key, excluded, component_count, None, subset_spectrum_ids)
+            payload = subset_summary
+        else:
+            payload = spectra_summary(session, class_key, excluded, component_count, None, None)
         payload.update(class_stats_status(session))
         return payload
 
@@ -205,9 +205,12 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
         spectrum = session.get(Spectrum, spectrum_id)
         if spectrum is None:
             raise HTTPException(status_code=404, detail="spectrum not found")
+        if spectrum.is_excluded:
+            return spectrum_to_dict(spectrum)
         spectrum.is_excluded = True
         spectrum.excluded_at = utcnow()
         adjust_class_stats_for_exclusion(session, spectrum, excluded=True)
+        job_manager.subsets.adjust_for_exclusion(spectrum, excluded=True)
         return spectrum_to_dict(spectrum)
 
     @router.post("/spectra/{spectrum_id}/restore")
@@ -215,25 +218,43 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
         spectrum = session.get(Spectrum, spectrum_id)
         if spectrum is None:
             raise HTTPException(status_code=404, detail="spectrum not found")
+        if not spectrum.is_excluded:
+            return spectrum_to_dict(spectrum)
         spectrum.is_excluded = False
         spectrum.excluded_at = None
         adjust_class_stats_for_exclusion(session, spectrum, excluded=False)
+        job_manager.subsets.adjust_for_exclusion(spectrum, excluded=False)
         return spectrum_to_dict(spectrum)
 
     @router.post("/classes/{class_key:path}/subsets")
     def subsets(class_key: str, payload: SubsetRequest, session: Session = Depends(get_session)) -> dict:
-        spectra_items = session.scalars(
-            select(Spectrum.id).where(Spectrum.class_key == class_key).order_by(Spectrum.file_name.asc())
+        spectra_items = session.execute(
+            select(
+                Spectrum.id,
+                Spectrum.axis_kind,
+                Spectrum.axis_unit,
+                Spectrum.is_excluded,
+            )
+            .where(Spectrum.class_key == class_key)
+            .order_by(Spectrum.file_name.asc())
         ).all()
-        spectrum_ids = sorted(int(item) for item in spectra_items)
-        if not spectrum_ids:
+        spectra_rows = [
+            {
+                "id": int(item.id),
+                "axis_kind": item.axis_kind,
+                "axis_unit": item.axis_unit,
+                "is_excluded": bool(item.is_excluded),
+            }
+            for item in spectra_items
+        ]
+        if not spectra_rows:
             raise HTTPException(status_code=404, detail="class has no spectra")
         return job_manager.create_subset(
             class_key=class_key,
             mode=payload.mode,
             parts=payload.parts,
             ratios=payload.ratios,
-            spectrum_ids=spectrum_ids,
+            spectra_rows=spectra_rows,
         )
 
     @router.get("/excluded/recent")
