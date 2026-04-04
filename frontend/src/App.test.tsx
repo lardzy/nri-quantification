@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { api, subscribeJob } from "./api";
+import type { AxisSummary } from "./types";
 
 const baseSpectrum = {
   id: 101,
@@ -31,9 +32,25 @@ const baseClass = {
   class_key: "棉|锦纶",
   class_display_name: "棉、锦纶",
   component_count: 2,
-  total_count: 1,
-  active_count: 1,
+  total_count: 2,
+  active_count: 2,
   excluded_count: 0
+};
+
+const fourierSpectrum = {
+  ...baseSpectrum,
+  id: 151,
+  file_name: "fourier-spectrum.csv",
+  source_path_last_seen: "/workspace/imports/fourier-spectrum.csv",
+  metadata: {
+    sample_id: "230340227",
+    acquisition_date: "2025-09-09",
+    acquisition_time: "08:38:55",
+    part_name: "A"
+  },
+  axis_kind: "wavenumber",
+  axis_unit: "cm^-1",
+  x_values: [3999.64, 4003.497, 4007.354]
 };
 
 const secondSpectrum = {
@@ -55,6 +72,13 @@ const secondClass = {
   active_count: 1,
   excluded_count: 0
 };
+
+const wavelengthAxisSummary: AxisSummary[] = [{ axis_kind: "wavelength", axis_unit: "nm", count: 1 }];
+const wavenumberAxisSummary: AxisSummary[] = [{ axis_kind: "wavenumber", axis_unit: "cm^-1", count: 1 }];
+const mixedAxisSummary: AxisSummary[] = [
+  { axis_kind: "wavelength", axis_unit: "nm", count: 1 },
+  { axis_kind: "wavenumber", axis_unit: "cm^-1", count: 1 }
+];
 
 vi.mock("./SpectrumChart", () => ({
   SpectrumChart: ({
@@ -171,29 +195,54 @@ describe("App", () => {
     vi.mocked(api.getClasses).mockImplementation(async () => [
       {
         ...baseClass,
-        active_count: excluded ? 0 : 1,
+        active_count: excluded ? 1 : 2,
         excluded_count: excluded ? 1 : 0
       },
       secondClass
     ]);
-    vi.mocked(api.getSpectra).mockImplementation(async ({ classKey, excluded: filter }) => ({
-      items:
-        classKey === secondClass.class_key
-          ? filter === "active" || filter === "all"
+    vi.mocked(api.getSpectra).mockImplementation(async ({ classKey, excluded: filter, axisKind, limit }) => {
+      if (classKey === secondClass.class_key) {
+        const summary: AxisSummary[] = filter === "excluded" ? [] : wavelengthAxisSummary;
+        const items =
+          filter === "active" || filter === "all"
             ? [{ ...secondSpectrum, is_excluded: false }]
+            : [];
+        return { items, count: items.length, limit: limit ?? 2000, axis_summary: summary };
+      }
+
+      const wavelengthSpectrum = { ...baseSpectrum, is_excluded: excluded };
+      const wavenumberSpectrum = { ...fourierSpectrum, is_excluded: false };
+      const axisSummary: AxisSummary[] =
+        filter === "excluded"
+          ? excluded
+            ? wavelengthAxisSummary
             : []
-          : filter === "excluded"
-            ? excluded
-              ? [{ ...baseSpectrum, is_excluded: true }]
-              : []
-            : filter === "all"
-              ? [{ ...baseSpectrum, is_excluded: excluded }]
-              : excluded
-                ? []
-                : [{ ...baseSpectrum, is_excluded: false }],
-      count: 1,
-      limit: 2000
-    }));
+          : filter === "all"
+            ? mixedAxisSummary
+            : excluded
+              ? wavenumberAxisSummary
+              : mixedAxisSummary;
+
+      let items =
+        filter === "excluded"
+          ? excluded
+            ? [wavelengthSpectrum]
+            : []
+          : filter === "all"
+            ? [wavelengthSpectrum, wavenumberSpectrum]
+            : excluded
+              ? [wavenumberSpectrum]
+              : [wavelengthSpectrum, wavenumberSpectrum];
+      if (axisKind) {
+        items = items.filter((item) => item.axis_kind === axisKind);
+      }
+      return {
+        items,
+        count: items.length,
+        limit: limit ?? 2000,
+        axis_summary: axisSummary
+      };
+    });
     vi.mocked(api.excludeSpectrum).mockImplementation(async () => {
       excluded = true;
       return { ...baseSpectrum, is_excluded: true };
@@ -222,6 +271,29 @@ describe("App", () => {
     expect(await screen.findByText("已锁定")).toBeInTheDocument();
     expect(screen.getByText("棉 60% / 锦纶 40%")).toBeInTheDocument();
     expect(screen.getByText(baseSpectrum.source_path_last_seen)).toBeInTheDocument();
+  });
+
+  it("shows axis switching for mixed-axis classes and reloads the selected axis", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await waitFor(() => expect(api.getSpectra).toHaveBeenCalled());
+    expect(await screen.findByText("波长 (nm) (1)")).toBeInTheDocument();
+    expect(screen.getByText("波数 (cm^-1) (1)")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: baseSpectrum.file_name })).toBeInTheDocument();
+
+    await user.click(screen.getByText("波数 (cm^-1) (1)"));
+    await waitFor(() =>
+      expect(api.getSpectra).toHaveBeenLastCalledWith({
+        classKey: baseClass.class_key,
+        excluded: "active",
+        axisKind: "wavenumber",
+        subsetId: undefined,
+        limit: 2000
+      })
+    );
+    expect(await screen.findByRole("button", { name: fourierSpectrum.file_name })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: baseSpectrum.file_name })).not.toBeInTheDocument();
   });
 
   it("supports shift-left and right-click quick exclude from the chart", async () => {
@@ -256,11 +328,26 @@ describe("App", () => {
       expect(api.getSpectra).toHaveBeenLastCalledWith({
         classKey: baseClass.class_key,
         excluded: "excluded",
+        axisKind: "wavelength",
         subsetId: undefined,
         limit: 2000
       })
     );
     expect(await screen.findByRole("button", { name: baseSpectrum.file_name })).toBeInTheDocument();
+  });
+
+  it("shows sample id, acquisition time and part metadata for new formats", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await waitFor(() => expect(api.getSpectra).toHaveBeenCalled());
+    await user.click(await screen.findByText("波数 (cm^-1) (1)"));
+    const curveButton = await screen.findByRole("button", { name: fourierSpectrum.file_name });
+    await user.click(curveButton);
+
+    expect(await screen.findByText("230340227")).toBeInTheDocument();
+    expect(screen.getByText("2025-09-09 08:38:55")).toBeInTheDocument();
+    expect(screen.getByText("A")).toBeInTheDocument();
   });
 
   it("locks a clicked spectrum, then excludes it from the detail card and can undo the action", async () => {

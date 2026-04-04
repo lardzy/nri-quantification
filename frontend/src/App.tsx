@@ -38,9 +38,9 @@ import {
 } from "@ant-design/icons";
 import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, subscribeJob } from "./api";
-import { formatSpectrumLabels } from "./chartInteraction";
+import { formatSpectrumLabels, getAxisDisplayLabel } from "./chartInteraction";
 import { SpectrumChart } from "./SpectrumChart";
-import type { FsEntry, JobItem, SpectrumClass, SpectrumItem, SubsetSummary } from "./types";
+import type { AxisKind, AxisSummary, FsEntry, JobItem, SpectrumClass, SpectrumItem, SubsetSummary } from "./types";
 import "./styles.css";
 
 const { Content, Sider } = Layout;
@@ -69,6 +69,20 @@ const EXPORT_SCOPE_LABELS: Record<ExportScope, string> = {
   excluded: "已剔除",
   all: "全部"
 };
+
+const AXIS_KIND_PRIORITY: AxisKind[] = ["wavelength", "wavenumber"];
+
+function sortAxisSummary(summary: AxisSummary[]): AxisSummary[] {
+  return [...summary].sort((left, right) => {
+    const leftPriority = AXIS_KIND_PRIORITY.indexOf(left.axis_kind);
+    const rightPriority = AXIS_KIND_PRIORITY.indexOf(right.axis_kind);
+    return (leftPriority === -1 ? 99 : leftPriority) - (rightPriority === -1 ? 99 : rightPriority);
+  });
+}
+
+function pickPreferredAxisKind(summary: AxisSummary[]): AxisKind | undefined {
+  return sortAxisSummary(summary)[0]?.axis_kind;
+}
 
 function useViewportWidth() {
   const [width, setWidth] = useState(() => window.innerWidth);
@@ -191,6 +205,30 @@ function DetailCard(props: {
   onClearLock: () => void;
 }) {
   const { spectrum, modeLabel, compact = false, onExclude, onRestore, onClearLock } = props;
+  const metadataRows = spectrum
+    ? [
+        spectrum.metadata.sample_id
+          ? { key: "sample_id", label: "样品编号", value: String(spectrum.metadata.sample_id) }
+          : null,
+        spectrum.metadata.acquisition_date || spectrum.metadata.acquisition_time
+          ? {
+              key: "acquisition",
+              label: "采集时间",
+              value: [spectrum.metadata.acquisition_date, spectrum.metadata.acquisition_time].filter(Boolean).join(" ")
+            }
+          : null,
+        spectrum.metadata.part_name
+          ? { key: "part_name", label: "部位", value: String(spectrum.metadata.part_name) }
+          : null,
+        spectrum.metadata.device_serial
+          ? { key: "device_serial", label: "设备序列号", value: String(spectrum.metadata.device_serial) }
+          : null,
+        spectrum.metadata.scan_config
+          ? { key: "scan_config", label: "扫描配置", value: String(spectrum.metadata.scan_config) }
+          : null,
+        { key: "source_path", label: "来源路径", value: spectrum.source_path_last_seen }
+      ].filter((item): item is { key: string; label: string; value: string } => item !== null)
+    : [];
   return (
     <Card
       className="detail-card"
@@ -227,17 +265,13 @@ function DetailCard(props: {
                   <span className="detail-value-text">{formatSpectrumLabels(spectrum.labels) || "无标签"}</span>
                 </Tooltip>
               </Descriptions.Item>
-              <Descriptions.Item label="来源路径">
-                <Tooltip title={spectrum.source_path_last_seen}>
-                  <span className="detail-value-text">{spectrum.source_path_last_seen}</span>
-                </Tooltip>
-              </Descriptions.Item>
-              <Descriptions.Item label="设备序列号">
-                <span className="detail-value-text">{String(spectrum.metadata.device_serial ?? "未知")}</span>
-              </Descriptions.Item>
-              <Descriptions.Item label="扫描配置">
-                <span className="detail-value-text">{String(spectrum.metadata.scan_config ?? "未知")}</span>
-              </Descriptions.Item>
+              {metadataRows.map((row) => (
+                <Descriptions.Item key={row.key} label={row.label}>
+                  <Tooltip title={row.value}>
+                    <span className="detail-value-text">{row.value}</span>
+                  </Tooltip>
+                </Descriptions.Item>
+              ))}
             </Descriptions>
             <Space wrap>
               {modeLabel === "已锁定" && (
@@ -283,6 +317,8 @@ function Workspace() {
   const [subsetInput, setSubsetInput] = useState<string>("4");
   const [subsets, setSubsets] = useState<SubsetSummary[]>([]);
   const [activeSubsetId, setActiveSubsetId] = useState<string | undefined>();
+  const [axisSummary, setAxisSummary] = useState<AxisSummary[]>([]);
+  const [selectedAxisKind, setSelectedAxisKind] = useState<AxisKind | undefined>();
   const [loadingSpectra, setLoadingSpectra] = useState(false);
   const [spectraTotal, setSpectraTotal] = useState(0);
   const [errorText, setErrorText] = useState<string | null>(null);
@@ -310,6 +346,10 @@ function Workspace() {
   const detailSpectrum = chartInteractionState.lockedSpectrum ?? pendingUndoSpectrum;
   const detailModeLabel = chartInteractionState.lockedSpectrum ? "已锁定" : pendingUndoSpectrum ? "最近操作" : null;
   const selectedClassLabel = selectedClass?.class_display_name ?? "未选择分类";
+  const selectedAxisSummary = axisSummary.find((item) => item.axis_kind === selectedAxisKind);
+  const selectedAxisLabel = selectedAxisSummary
+    ? getAxisDisplayLabel(selectedAxisSummary.axis_kind, selectedAxisSummary.axis_unit)
+    : null;
 
   useEffect(() => {
     if (isScreenTooSmall) {
@@ -339,6 +379,8 @@ function Workspace() {
       startTransition(() => {
         setSpectra([]);
         setSpectraTotal(0);
+        setAxisSummary([]);
+        setSelectedAxisKind(undefined);
       });
       setLoadingSpectra(false);
       return;
@@ -346,9 +388,22 @@ function Workspace() {
     startTransition(() => {
       setSpectra([]);
       setSpectraTotal(0);
+      setAxisSummary([]);
+      setSelectedAxisKind(undefined);
     });
-    void loadSpectra(selectedClass, excludedFilter, activeSubsetId);
+    void probeAxisSummary(selectedClass, excludedFilter, activeSubsetId);
   }, [activeSubsetId, excludedFilter, isScreenTooSmall, selectedClass]);
+
+  useEffect(() => {
+    if (isScreenTooSmall || !selectedClass || !selectedAxisKind) {
+      return;
+    }
+    startTransition(() => {
+      setSpectra([]);
+      setSpectraTotal(0);
+    });
+    void loadSpectra(selectedClass, excludedFilter, activeSubsetId, selectedAxisKind);
+  }, [activeSubsetId, excludedFilter, isScreenTooSmall, selectedAxisKind, selectedClass]);
 
   useEffect(() => {
     setChartInteractionState((current) => ({
@@ -382,7 +437,7 @@ function Workspace() {
     startTransition(() => setRecentExcluded(items));
   }
 
-  async function loadSpectra(
+  async function probeAxisSummary(
     targetClass: SpectrumClass,
     targetFilter: "active" | "excluded" | "all",
     subsetId: string | undefined
@@ -395,12 +450,60 @@ function Workspace() {
         classKey: targetClass.class_key,
         excluded: targetFilter,
         subsetId,
+        limit: 1
+      });
+      if (requestId !== loadRequestIdRef.current) {
+        return;
+      }
+      const nextAxisSummary = sortAxisSummary(data.axis_summary);
+      startTransition(() => {
+        setAxisSummary(nextAxisSummary);
+        setSelectedAxisKind(pickPreferredAxisKind(nextAxisSummary));
+      });
+    } catch (error) {
+      if (requestId !== loadRequestIdRef.current) {
+        return;
+      }
+      setErrorText(String(error));
+    } finally {
+      if (requestId === loadRequestIdRef.current) {
+        setLoadingSpectra(false);
+      }
+    }
+  }
+
+  async function loadSpectra(
+    targetClass: SpectrumClass,
+    targetFilter: "active" | "excluded" | "all",
+    subsetId: string | undefined,
+    axisKind: AxisKind
+  ) {
+    const requestId = loadRequestIdRef.current + 1;
+    loadRequestIdRef.current = requestId;
+    setLoadingSpectra(true);
+    try {
+      const data = await api.getSpectra({
+        classKey: targetClass.class_key,
+        excluded: targetFilter,
+        axisKind,
+        subsetId,
         limit: 2000
       });
       if (requestId !== loadRequestIdRef.current) {
         return;
       }
+      const nextAxisSummary = sortAxisSummary(data.axis_summary);
+      if (!nextAxisSummary.some((item) => item.axis_kind === axisKind)) {
+        startTransition(() => {
+          setAxisSummary(nextAxisSummary);
+          setSelectedAxisKind(pickPreferredAxisKind(nextAxisSummary));
+          setSpectra([]);
+          setSpectraTotal(0);
+        });
+        return;
+      }
       startTransition(() => {
+        setAxisSummary(nextAxisSummary);
         setSpectra(data.items);
         setSpectraTotal(data.count);
       });
@@ -484,7 +587,11 @@ function Workspace() {
       await refreshClasses();
       await refreshExcluded();
       if (selectedClass && !isScreenTooSmall) {
-        await loadSpectra(selectedClass, excludedFilter, activeSubsetId);
+        if (selectedAxisKind) {
+          await loadSpectra(selectedClass, excludedFilter, activeSubsetId, selectedAxisKind);
+        } else {
+          await probeAxisSummary(selectedClass, excludedFilter, activeSubsetId);
+        }
       }
       messageApi.success(`已恢复 ${restored.file_name}`);
     } catch (error) {
@@ -516,6 +623,13 @@ function Workspace() {
       });
       await refreshClasses();
       await refreshExcluded();
+      if (selectedClass && !isScreenTooSmall) {
+        if (selectedAxisKind) {
+          await loadSpectra(selectedClass, excludedFilter, activeSubsetId, selectedAxisKind);
+        } else {
+          await probeAxisSummary(selectedClass, excludedFilter, activeSubsetId);
+        }
+      }
 
       const notificationKey = `exclude-${updated.id}`;
       notificationApi.open({
@@ -578,6 +692,7 @@ function Workspace() {
     if (!selectedClass) {
       return;
     }
+    const needsManualReload = activeSubsetId === undefined;
     loadRequestIdRef.current += 1;
     setLoadingSpectra(true);
     setSubsets([]);
@@ -587,12 +702,13 @@ function Workspace() {
     setPendingUndoSpectrum(null);
     setSpectra([]);
     setSpectraTotal(0);
+    setAxisSummary([]);
+    setSelectedAxisKind(undefined);
     setChartInteractionState({ hoveredSpectrum: null, lockedSpectrum: null });
     setChartResetToken((current) => current + 1);
-    if (activeSubsetId) {
-      return;
+    if (needsManualReload) {
+      void probeAxisSummary(selectedClass, excludedFilter, undefined);
     }
-    void loadSpectra(selectedClass, excludedFilter, undefined);
   }
 
   const rightPanel = (
@@ -773,6 +889,8 @@ function Workspace() {
                                 setPendingUndoSpectrum(null);
                                 setSpectra([]);
                                 setSpectraTotal(0);
+                                setAxisSummary([]);
+                                setSelectedAxisKind(undefined);
                                 setChartInteractionState({ hoveredSpectrum: null, lockedSpectrum: null });
                                 setChartResetToken((current) => current + 1);
                               }}
@@ -845,7 +963,20 @@ function Workspace() {
                       >
                         撤销最近剔除
                       </Button>
-                      <Button icon={<ReloadOutlined />} disabled={!selectedClass} onClick={() => selectedClass && void loadSpectra(selectedClass, excludedFilter, activeSubsetId)}>
+                      <Button
+                        icon={<ReloadOutlined />}
+                        disabled={!selectedClass}
+                        onClick={() => {
+                          if (!selectedClass) {
+                            return;
+                          }
+                          if (selectedAxisKind) {
+                            void loadSpectra(selectedClass, excludedFilter, activeSubsetId, selectedAxisKind);
+                            return;
+                          }
+                          void probeAxisSummary(selectedClass, excludedFilter, activeSubsetId);
+                        }}
+                      >
                         刷新
                       </Button>
                     </Space>
@@ -916,6 +1047,7 @@ function Workspace() {
                           {selectedClassLabel}
                         </Tag>
                       </Tooltip>
+                      {selectedAxisLabel && <Tag>{selectedAxisLabel}</Tag>}
                       <Text type="secondary">可预览：{previewSpectra.length}</Text>
                       <Button size="small" icon={<ReloadOutlined />} onClick={() => setChartResetToken((current) => current + 1)} disabled={!selectedClass || !canRender}>
                         恢复默认缩放
@@ -924,6 +1056,18 @@ function Workspace() {
                   }
                 >
                   {!selectedClass && <Empty description="请选择左侧分类后开始预览" />}
+                  {selectedClass && axisSummary.length > 1 && (
+                    <div className="axis-switch-wrap">
+                      <Segmented
+                        value={selectedAxisKind}
+                        onChange={(value) => setSelectedAxisKind(value as AxisKind)}
+                        options={axisSummary.map((item) => ({
+                          value: item.axis_kind,
+                          label: `${getAxisDisplayLabel(item.axis_kind, item.axis_unit)} (${item.count})`
+                        }))}
+                      />
+                    </div>
+                  )}
                   {selectedClass && !canRender && (
                     <Alert
                       type="warning"
@@ -939,15 +1083,15 @@ function Workspace() {
                           <Empty
                             description={
                               excludedFilter === "excluded"
-                                ? "当前没有可预览的已剔除光谱。"
+                                ? `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的已剔除光谱。`
                                 : excludedFilter === "all"
-                                  ? "当前没有可预览的光谱。"
-                                  : "当前没有可预览的未剔除光谱。"
+                                  ? `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的光谱。`
+                                  : `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的未剔除光谱。`
                             }
                           />
                         ) : (
                           <SpectrumChart
-                            key={`${selectedClass.class_key}:${excludedFilter}:${activeSubsetId ?? "all"}`}
+                            key={`${selectedClass.class_key}:${excludedFilter}:${selectedAxisKind ?? "all"}:${activeSubsetId ?? "all"}`}
                             spectra={previewSpectra}
                             resetSignal={chartResetToken}
                             hoveredSpectrumId={hoveredSpectrumId}

@@ -1,4 +1,4 @@
-import type { SpectrumItem } from "./types";
+import type { AxisKind, SpectrumItem } from "./types";
 
 export type SpectrumHit = {
   spectrum: SpectrumItem;
@@ -112,6 +112,27 @@ export function formatAxisValue(value: number, axis: "x" | "y"): string {
     maximumFractionDigits: digits
   });
   return formatter.format(Number(value.toFixed(digits)));
+}
+
+export function getAxisDisplayLabel(axisKind: AxisKind | string, axisUnit: string | null | undefined): string {
+  if (axisKind === "wavelength") {
+    return axisUnit ? `波长 (${axisUnit})` : "波长";
+  }
+  if (axisKind === "wavenumber") {
+    return axisUnit ? `波数 (${axisUnit})` : "波数";
+  }
+  return axisUnit ? `波长/波数 (${axisUnit})` : "波长/波数";
+}
+
+export function getXAxisTitle(spectra: SpectrumItem[]): string {
+  if (spectra.length === 0) {
+    return "波长/波数";
+  }
+  const axisKinds = new Set(spectra.map((item) => item.axis_kind));
+  if (axisKinds.size === 1) {
+    return getAxisDisplayLabel(spectra[0].axis_kind, spectra[0].axis_unit);
+  }
+  return "波长/波数";
 }
 
 export function getSpectraExtents(spectra: SpectrumItem[]): { xExtent: Extent; yExtent: Extent } {

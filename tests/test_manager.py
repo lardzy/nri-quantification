@@ -29,6 +29,31 @@ def make_csv_text(labels: list[tuple[str, float]], point_count: int = 228) -> st
     return "\n".join(lines) + "\n"
 
 
+def make_fourier_csv_text(labels: list[tuple[str, float]], part_name: str = "") -> str:
+    lines = []
+    for index in range(1557):
+        wavenumber = 3999.64 + index * 3.857
+        absorbance = 0.2 + index * 0.0001
+        lines.append(f"{wavenumber:.3f},{absorbance:.7f},,,")
+    footer = [part_name] if part_name else [""]
+    for name, value in labels:
+        footer.extend([name, str(value)])
+    lines.append(",".join(footer))
+    return "\n".join(lines) + "\n"
+
+
+def make_grating_csv_text(labels: list[tuple[str, float]], part_name: str = "") -> str:
+    lines = []
+    for wavelength in range(1000, 1800):
+        absorbance = 0.08 + (wavelength - 1000) * 0.00015
+        lines.append(f"{wavelength},{absorbance:.15f},,,,,")
+    footer = [part_name] if part_name else [""]
+    for name, value in labels:
+        footer.extend([name, str(value)])
+    lines.append(",".join(footer))
+    return "\n".join(lines) + "\n"
+
+
 class ManagerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -169,6 +194,107 @@ class ManagerTests(unittest.TestCase):
         exported_path = exported_candidates[0]
         self.assertTrue(exported_path.exists())
         self.assertEqual(exported_path.read_text(encoding="utf-8"), original_text)
+
+    def test_imports_fourier_and_grating_formats_with_axis_summary(self) -> None:
+        fourier_name = "样品编号 230340227  2025-09-09 083855 GMT+0800.csv"
+        grating_name = "SupNIR-3100230122253A01_20240924163908.csv"
+        labels = [("棉", 71.0), ("聚酯纤维", 29.0)]
+        (self.import_root / fourier_name).write_text(make_fourier_csv_text(labels, part_name="A"), encoding="utf-8")
+        (self.import_root / grating_name).write_text(make_grating_csv_text(labels, part_name=""), encoding="utf-8")
+
+        job = self.client.post("/api/import-jobs", json={"root_path": str(self.import_root), "recursive": True}).json()
+        completed = self._wait_for_job(job["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["imported_count"], 2)
+        self.assertEqual(completed["failed_count"], 0)
+
+        classes = self.client.get("/api/classes", params={"sort": "name"}).json()["items"]
+        self.assertEqual(len(classes), 1)
+        self.assertEqual(classes[0]["class_key"], "棉|聚酯纤维")
+
+        spectra_payload = self.client.get(
+            "/api/spectra",
+            params={"class_key": classes[0]["class_key"], "excluded": "active", "limit": 2000},
+        ).json()
+        self.assertEqual(spectra_payload["count"], 2)
+        axis_summary = sorted(spectra_payload["axis_summary"], key=lambda item: item["axis_kind"])
+        self.assertEqual(
+            axis_summary,
+            [
+                {"axis_kind": "wavelength", "axis_unit": "nm", "count": 1},
+                {"axis_kind": "wavenumber", "axis_unit": "cm^-1", "count": 1},
+            ],
+        )
+
+        wavelength_payload = self.client.get(
+            "/api/spectra",
+            params={
+                "class_key": classes[0]["class_key"],
+                "excluded": "active",
+                "axis_kind": "wavelength",
+                "limit": 2000,
+            },
+        ).json()
+        self.assertEqual(wavelength_payload["count"], 1)
+        self.assertEqual(wavelength_payload["items"][0]["axis_kind"], "wavelength")
+        self.assertEqual(wavelength_payload["items"][0]["metadata"]["sample_id"], "230122253")
+        self.assertEqual(wavelength_payload["items"][0]["metadata"]["acquisition_date"], "2024-09-24")
+        self.assertEqual(wavelength_payload["items"][0]["metadata"]["acquisition_time"], "16:39:08")
+
+        wavenumber_payload = self.client.get(
+            "/api/spectra",
+            params={
+                "class_key": classes[0]["class_key"],
+                "excluded": "active",
+                "axis_kind": "wavenumber",
+                "limit": 2000,
+            },
+        ).json()
+        self.assertEqual(wavenumber_payload["count"], 1)
+        self.assertEqual(wavenumber_payload["items"][0]["axis_kind"], "wavenumber")
+        self.assertEqual(wavenumber_payload["items"][0]["metadata"]["sample_id"], "230340227")
+        self.assertEqual(wavenumber_payload["items"][0]["metadata"]["acquisition_date"], "2025-09-09")
+        self.assertEqual(wavenumber_payload["items"][0]["metadata"]["acquisition_time"], "08:38:55")
+        self.assertEqual(wavenumber_payload["items"][0]["metadata"]["part_name"], "A")
+
+    def test_imports_new_formats_when_filename_metadata_does_not_match(self) -> None:
+        fourier_name = "未知傅里叶文件.csv"
+        grating_name = "unknown-grating-format.csv"
+        labels = [("棉", 100.0)]
+        (self.import_root / fourier_name).write_text(make_fourier_csv_text(labels), encoding="utf-8")
+        (self.import_root / grating_name).write_text(make_grating_csv_text(labels, part_name="前片"), encoding="utf-8")
+
+        job = self.client.post("/api/import-jobs", json={"root_path": str(self.import_root), "recursive": True}).json()
+        completed = self._wait_for_job(job["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["imported_count"], 2)
+        self.assertEqual(completed["failed_count"], 0)
+
+        payload = self.client.get(
+            "/api/spectra",
+            params={"class_key": "棉", "excluded": "active", "limit": 2000},
+        ).json()
+        self.assertEqual(payload["count"], 2)
+        metadata_by_file = {item["file_name"]: item["metadata"] for item in payload["items"]}
+        self.assertIsNone(metadata_by_file[fourier_name]["sample_id"])
+        self.assertIsNone(metadata_by_file[fourier_name]["acquisition_date"])
+        self.assertIsNone(metadata_by_file[fourier_name]["acquisition_time"])
+        self.assertIsNone(metadata_by_file[grating_name]["sample_id"])
+        self.assertIsNone(metadata_by_file[grating_name]["acquisition_date"])
+        self.assertIsNone(metadata_by_file[grating_name]["acquisition_time"])
+        self.assertEqual(metadata_by_file[grating_name]["part_name"], "前片")
+
+    def test_rejects_invalid_new_format_footer_rows(self) -> None:
+        invalid_name = "样品编号 230340227  2025-09-09 083855 GMT+0800.csv"
+        invalid_text = make_fourier_csv_text([("棉", 60.0)])
+        invalid_text = invalid_text.rsplit("\n", 2)[0] + "\n,棉,60.0,未知纤维,40.0\n"
+        (self.import_root / invalid_name).write_text(invalid_text, encoding="utf-8")
+
+        job = self.client.post("/api/import-jobs", json={"root_path": str(self.import_root), "recursive": True}).json()
+        completed = self._wait_for_job(job["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["imported_count"], 0)
+        self.assertEqual(completed["failed_count"], 1)
 
     def _wait_for_job(self, job_id: int, timeout_seconds: float = 10.0) -> dict:
         deadline = time.time() + timeout_seconds

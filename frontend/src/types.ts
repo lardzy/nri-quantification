@@ -19,12 +19,20 @@ export type SpectrumClass = {
   excluded_count: number;
 };
 
+export type AxisKind = "wavelength" | "wavenumber";
+
+export type AxisSummary = {
+  axis_kind: AxisKind;
+  axis_unit: string;
+  count: number;
+};
+
 export type SpectrumItem = {
   id: number;
   file_name: string;
   source_path_last_seen: string;
   metadata: Record<string, unknown>;
-  axis_kind: string;
+  axis_kind: AxisKind | string;
   axis_unit: string;
   point_count: number;
   x_values: number[];

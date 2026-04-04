@@ -1,4 +1,4 @@
-import type { BrowseResponse, JobItem, SpectrumClass, SpectrumItem, SubsetSummary } from "./types";
+import type { AxisKind, AxisSummary, BrowseResponse, JobItem, SpectrumClass, SpectrumItem, SubsetSummary } from "./types";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -43,11 +43,13 @@ export const api = {
   async getSpectra(params: {
     classKey?: string;
     excluded: "active" | "excluded" | "all";
+    axisKind?: AxisKind;
     subsetId?: string;
     limit?: number;
-  }): Promise<{ items: SpectrumItem[]; count: number; limit: number }> {
+  }): Promise<{ items: SpectrumItem[]; count: number; limit: number; axis_summary: AxisSummary[] }> {
     const query = new URLSearchParams();
     if (params.classKey) query.set("class_key", params.classKey);
+    if (params.axisKind) query.set("axis_kind", params.axisKind);
     if (params.subsetId) query.set("subset_id", params.subsetId);
     query.set("excluded", params.excluded);
     query.set("limit", String(params.limit ?? 500));

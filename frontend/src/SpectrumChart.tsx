@@ -6,6 +6,7 @@ import {
   findNearestSpectrumHit,
   formatAxisValue,
   formatSpectrumLabels,
+  getXAxisTitle,
   getSpectraExtents,
   shiftZoomWindow
 } from "./chartInteraction";
@@ -127,7 +128,7 @@ export function SpectrumChart({
       grid: { left: 118, right: 36, top: 36, bottom: 102, containLabel: false },
       xAxis: {
         type: "value",
-        name: spectra[0]?.axis_unit === "nm" ? "波长 (nm)" : "X",
+        name: getXAxisTitle(spectra),
         nameLocation: "middle",
         nameGap: 46,
         nameTextStyle: { fontWeight: 600, padding: [18, 0, 0, 0] },

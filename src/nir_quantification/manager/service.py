@@ -74,6 +74,31 @@ def spectrum_to_dict(spectrum: Spectrum) -> dict[str, Any]:
     }
 
 
+def axis_summary_for_query(
+    session: Session,
+    class_key: str | None,
+    excluded: str,
+    component_count: int | None,
+    subset_spectrum_ids: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    stmt = select(
+        Spectrum.axis_kind,
+        Spectrum.axis_unit,
+        func.count(Spectrum.id).label("count"),
+    )
+    stmt = _apply_spectrum_filters(stmt, class_key, excluded, component_count, None, subset_spectrum_ids)
+    stmt = stmt.group_by(Spectrum.axis_kind, Spectrum.axis_unit).order_by(Spectrum.axis_kind.asc(), Spectrum.axis_unit.asc())
+    rows = session.execute(stmt).all()
+    return [
+        {
+            "axis_kind": row.axis_kind,
+            "axis_unit": row.axis_unit,
+            "count": int(row.count or 0),
+        }
+        for row in rows
+    ]
+
+
 def job_to_dict(job: Job) -> dict[str, Any]:
     return {
         "id": job.id,
@@ -134,8 +159,23 @@ def spectrum_query(
     class_key: str | None,
     excluded: str,
     component_count: int | None,
+    axis_kind: str | None = None,
+    subset_spectrum_ids: list[int] | None = None,
 ) -> Select[tuple[Spectrum]]:
     stmt = select(Spectrum).options(joinedload(Spectrum.components))
+    stmt = _apply_spectrum_filters(stmt, class_key, excluded, component_count, axis_kind, subset_spectrum_ids)
+    stmt = stmt.order_by(Spectrum.file_name.asc())
+    return stmt
+
+
+def _apply_spectrum_filters(
+    stmt: Select,
+    class_key: str | None,
+    excluded: str,
+    component_count: int | None,
+    axis_kind: str | None,
+    subset_spectrum_ids: list[int] | None,
+) -> Select:
     if class_key:
         stmt = stmt.where(Spectrum.class_key == class_key)
     if excluded == "active":
@@ -144,5 +184,8 @@ def spectrum_query(
         stmt = stmt.where(Spectrum.is_excluded.is_(True))
     if component_count is not None:
         stmt = stmt.where(Spectrum.component_count == component_count)
-    stmt = stmt.order_by(Spectrum.file_name.asc())
+    if axis_kind:
+        stmt = stmt.where(Spectrum.axis_kind == axis_kind)
+    if subset_spectrum_ids:
+        stmt = stmt.where(Spectrum.id.in_(subset_spectrum_ids))
     return stmt

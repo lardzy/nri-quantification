@@ -241,6 +241,10 @@ body {
   cursor: crosshair;
 }
 
+.axis-switch-wrap {
+  margin-bottom: 12px;
+}
+
 .current-class-pill {
   max-width: 280px;
   overflow: hidden;

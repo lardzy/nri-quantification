@@ -16,7 +16,7 @@ from .config import ManagerSettings
 from .db import decode_json, session_scope
 from .jobs import JobManager
 from .models import Job, Spectrum
-from .service import job_to_dict, list_classes, spectrum_query, spectrum_to_dict, utcnow
+from .service import axis_summary_for_query, job_to_dict, list_classes, spectrum_query, spectrum_to_dict, utcnow
 
 
 class ImportJobRequest(BaseModel):
@@ -140,19 +140,27 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
         class_key: str | None = None,
         excluded: Literal["active", "excluded", "all"] = "active",
         component_count: int | None = None,
+        axis_kind: Literal["wavelength", "wavenumber"] | None = None,
         subset_id: str | None = None,
         limit: Annotated[int, Query(ge=1, le=2000)] = 500,
         session: Session = Depends(get_session),
     ) -> dict:
-        stmt = spectrum_query(session, class_key, excluded, component_count)
+        subset_spectrum_ids: list[int] | None = None
         if subset_id:
             subset = job_manager.subsets.get(subset_id)
             if subset is None:
                 raise HTTPException(status_code=404, detail="subset not found")
-            stmt = stmt.where(Spectrum.id.in_(subset["spectrum_ids"]))
+            subset_spectrum_ids = list(subset["spectrum_ids"])
+        axis_summary = axis_summary_for_query(session, class_key, excluded, component_count, subset_spectrum_ids)
+        stmt = spectrum_query(session, class_key, excluded, component_count, axis_kind, subset_spectrum_ids)
         total = int(session.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0)
         spectra_items = session.scalars(stmt.limit(limit)).unique().all()
-        return {"items": [spectrum_to_dict(item) for item in spectra_items], "count": total, "limit": limit}
+        return {
+            "items": [spectrum_to_dict(item) for item in spectra_items],
+            "count": total,
+            "limit": limit,
+            "axis_summary": axis_summary,
+        }
 
     @router.post("/spectra/{spectrum_id}/exclude")
     def exclude_spectrum(spectrum_id: int, session: Session = Depends(get_session)) -> dict:
