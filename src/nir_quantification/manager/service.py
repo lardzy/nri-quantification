@@ -8,7 +8,7 @@ from sqlalchemy import Select, case, delete, func, select
 from sqlalchemy.orm import Session
 
 from .db import decode_json, encode_json
-from .models import ClassStat, Job, Spectrum, SpectrumComponent
+from .models import ClassAxisStat, ClassStat, Job, Spectrum, SpectrumComponent
 from .parsers import ParsedComponent, ParsedSpectrum
 
 SPECTRUM_DETAIL_COLUMNS = (
@@ -116,9 +116,10 @@ def spectrum_row_to_dict(row: Any) -> dict[str, Any]:
 
 
 def class_stats_status(session: Session) -> dict[str, str | None]:
-    stats_count = int(session.scalar(select(func.count()).select_from(ClassStat)) or 0)
-    spectra_count = int(session.scalar(select(func.count()).select_from(Spectrum)) or 0)
-    if stats_count > 0 or spectra_count == 0:
+    stats_exists = session.scalar(select(ClassStat.class_key).limit(1)) is not None
+    axis_stats_exists = session.scalar(select(ClassAxisStat.class_key).limit(1)) is not None
+    spectra_exists = session.scalar(select(Spectrum.id).limit(1)) is not None
+    if (stats_exists and axis_stats_exists) or not spectra_exists:
         return {"status": "ready", "progress_message": None}
 
     latest_job = session.scalar(
@@ -169,7 +170,7 @@ def list_classes(session: Session, sort_by: str = "count") -> list[dict[str, Any
 def recompute_class_stats(session: Session, class_keys: Sequence[str] | None = None) -> int:
     session.flush()
     keys = sorted({key for key in class_keys or [] if key})
-    stmt = (
+    class_stmt = (
         select(
             Spectrum.class_key,
             Spectrum.class_display_name,
@@ -180,32 +181,61 @@ def recompute_class_stats(session: Session, class_keys: Sequence[str] | None = N
         )
         .group_by(Spectrum.class_key, Spectrum.class_display_name, Spectrum.component_count)
     )
+    axis_stmt = (
+        select(
+            Spectrum.class_key,
+            Spectrum.axis_kind,
+            Spectrum.axis_unit,
+            func.count(Spectrum.id).label("total_count"),
+            func.sum(case((Spectrum.is_excluded.is_(False), 1), else_=0)).label("active_count"),
+            func.sum(case((Spectrum.is_excluded.is_(True), 1), else_=0)).label("excluded_count"),
+        )
+        .group_by(Spectrum.class_key, Spectrum.axis_kind, Spectrum.axis_unit)
+    )
     if keys:
-        stmt = stmt.where(Spectrum.class_key.in_(keys))
+        class_stmt = class_stmt.where(Spectrum.class_key.in_(keys))
+        axis_stmt = axis_stmt.where(Spectrum.class_key.in_(keys))
 
     if keys:
         session.execute(delete(ClassStat).where(ClassStat.class_key.in_(keys)))
+        session.execute(delete(ClassAxisStat).where(ClassAxisStat.class_key.in_(keys)))
     else:
         session.execute(delete(ClassStat))
+        session.execute(delete(ClassAxisStat))
 
-    rows = session.execute(stmt).all()
-    if not rows:
-        return 0
+    rows = session.execute(class_stmt).all()
+    axis_rows = session.execute(axis_stmt).all()
 
-    session.add_all(
-        [
-            ClassStat(
-                class_key=row.class_key,
-                class_display_name=row.class_display_name,
-                component_count=row.component_count,
-                total_count=int(row.total_count or 0),
-                active_count=int(row.active_count or 0),
-                excluded_count=int(row.excluded_count or 0),
-                updated_at=utcnow(),
-            )
-            for row in rows
-        ]
-    )
+    if rows:
+        session.add_all(
+            [
+                ClassStat(
+                    class_key=row.class_key,
+                    class_display_name=row.class_display_name,
+                    component_count=row.component_count,
+                    total_count=int(row.total_count or 0),
+                    active_count=int(row.active_count or 0),
+                    excluded_count=int(row.excluded_count or 0),
+                    updated_at=utcnow(),
+                )
+                for row in rows
+            ]
+        )
+    if axis_rows:
+        session.add_all(
+            [
+                ClassAxisStat(
+                    class_key=row.class_key,
+                    axis_kind=row.axis_kind,
+                    axis_unit=row.axis_unit,
+                    total_count=int(row.total_count or 0),
+                    active_count=int(row.active_count or 0),
+                    excluded_count=int(row.excluded_count or 0),
+                    updated_at=utcnow(),
+                )
+                for row in axis_rows
+            ]
+        )
     return len(rows)
 
 
@@ -217,9 +247,12 @@ def spectra_summary(
     axis_kind: str | None = None,
     subset_spectrum_ids: list[int] | None = None,
 ) -> dict[str, Any]:
-    count_stmt = select(func.count(Spectrum.id))
-    count_stmt = _apply_spectrum_filters(count_stmt, class_key, excluded, component_count, axis_kind, subset_spectrum_ids)
-    total_count = int(session.scalar(count_stmt) or 0)
+    cached_total_count = _cached_total_count(session, class_key, excluded, component_count, axis_kind, subset_spectrum_ids)
+    total_count = cached_total_count
+    if total_count is None:
+        count_stmt = select(func.count(Spectrum.id))
+        count_stmt = _apply_spectrum_filters(count_stmt, class_key, excluded, component_count, axis_kind, subset_spectrum_ids)
+        total_count = int(session.scalar(count_stmt) or 0)
     return {
         "total_count": total_count,
         "axis_summary": axis_summary_for_query(session, class_key, excluded, component_count, subset_spectrum_ids),
@@ -233,6 +266,38 @@ def axis_summary_for_query(
     component_count: int | None,
     subset_spectrum_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
+    if class_key and component_count is None and subset_spectrum_ids is None:
+        cached_rows = session.execute(
+            select(
+                ClassAxisStat.axis_kind,
+                ClassAxisStat.axis_unit,
+                ClassAxisStat.total_count,
+                ClassAxisStat.active_count,
+                ClassAxisStat.excluded_count,
+            )
+            .where(ClassAxisStat.class_key == class_key)
+            .order_by(ClassAxisStat.axis_kind.asc(), ClassAxisStat.axis_unit.asc())
+        ).all()
+        if cached_rows:
+            items = []
+            for row in cached_rows:
+                if excluded == "active":
+                    count = int(row.active_count or 0)
+                elif excluded == "excluded":
+                    count = int(row.excluded_count or 0)
+                else:
+                    count = int(row.total_count or 0)
+                if count <= 0:
+                    continue
+                items.append(
+                    {
+                        "axis_kind": row.axis_kind,
+                        "axis_unit": row.axis_unit,
+                        "count": count,
+                    }
+                )
+            return items
+
     stmt = select(
         Spectrum.axis_kind,
         Spectrum.axis_unit,
@@ -333,3 +398,39 @@ def _apply_spectrum_filters(
     if subset_spectrum_ids:
         stmt = stmt.where(Spectrum.id.in_(subset_spectrum_ids))
     return stmt
+
+
+def _cached_total_count(
+    session: Session,
+    class_key: str | None,
+    excluded: str,
+    component_count: int | None,
+    axis_kind: str | None,
+    subset_spectrum_ids: list[int] | None,
+) -> int | None:
+    if not class_key or component_count is not None or subset_spectrum_ids is not None:
+        return None
+    if axis_kind is not None:
+        rows = session.execute(
+            select(
+                ClassAxisStat.total_count,
+                ClassAxisStat.active_count,
+                ClassAxisStat.excluded_count,
+            ).where(ClassAxisStat.class_key == class_key, ClassAxisStat.axis_kind == axis_kind)
+        ).all()
+        if not rows:
+            return None
+        if excluded == "active":
+            return sum(int(row.active_count or 0) for row in rows)
+        if excluded == "excluded":
+            return sum(int(row.excluded_count or 0) for row in rows)
+        return sum(int(row.total_count or 0) for row in rows)
+
+    row = session.get(ClassStat, class_key)
+    if row is None:
+        return None
+    if excluded == "active":
+        return int(row.active_count or 0)
+    if excluded == "excluded":
+        return int(row.excluded_count or 0)
+    return int(row.total_count or 0)

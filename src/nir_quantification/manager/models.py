@@ -71,6 +71,18 @@ class ClassStat(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class ClassAxisStat(Base):
+    __tablename__ = "class_axis_stats"
+
+    class_key: Mapped[str] = mapped_column(String(512), primary_key=True)
+    axis_kind: Mapped[str] = mapped_column(String(64), primary_key=True)
+    axis_unit: Mapped[str] = mapped_column(String(64), primary_key=True)
+    total_count: Mapped[int] = mapped_column(Integer, default=0)
+    active_count: Mapped[int] = mapped_column(Integer, default=0)
+    excluded_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class Job(Base):
     __tablename__ = "jobs"
 

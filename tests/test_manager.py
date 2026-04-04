@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from nir_quantification.manager.app import create_app
 from nir_quantification.manager.config import ManagerSettings
 from nir_quantification.manager.db import session_scope
-from nir_quantification.manager.models import ClassStat
+from nir_quantification.manager.models import ClassAxisStat, ClassStat
 
 
 def make_csv_text(labels: list[tuple[str, float]], point_count: int = 228) -> str:
@@ -231,6 +231,13 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(len(classes), 1)
         self.assertEqual(classes[0]["class_key"], "棉|聚酯纤维")
 
+        summary_payload = self.client.get(
+            "/api/spectra/summary",
+            params={"class_key": classes[0]["class_key"], "excluded": "active"},
+        ).json()
+        self.assertEqual(summary_payload["status"], "ready")
+        self.assertEqual(summary_payload["total_count"], 2)
+
         spectra_payload = self.client.get(
             "/api/spectra",
             params={"class_key": classes[0]["class_key"], "excluded": "active", "limit": 2000},
@@ -324,6 +331,7 @@ class ManagerTests(unittest.TestCase):
 
         with session_scope(self.client.app.state.session_factory) as session:
             session.query(ClassStat).delete()
+            session.query(ClassAxisStat).delete()
 
         restart_client = TestClient(create_app(self.settings))
         try:
@@ -336,6 +344,14 @@ class ManagerTests(unittest.TestCase):
                 if payload["items"]:
                     self.assertEqual(payload["meta"]["status"], "ready")
                     self.assertEqual(payload["items"][0]["class_key"], "聚酯纤维")
+                    with session_scope(restart_client.app.state.session_factory) as session:
+                        self.assertGreater(session.query(ClassAxisStat).count(), 0)
+                        index_names = {
+                            row[1]
+                            for row in session.connection().exec_driver_sql("PRAGMA index_list('spectra')").all()
+                        }
+                        self.assertIn("ix_spectra_class_excluded_axis_file", index_names)
+                        self.assertIn("ix_spectra_class_excluded_file", index_names)
                     return
                 time.sleep(0.05)
         finally:

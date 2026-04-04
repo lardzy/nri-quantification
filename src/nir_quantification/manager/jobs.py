@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 
 from .config import ManagerSettings
 from .db import decode_json, encode_json, session_scope
-from .models import ClassStat, Job, Spectrum
+from .models import ClassAxisStat, ClassStat, Job, Spectrum
 from .parsers import ParserRegistry
 from .service import build_classification, job_to_dict, recompute_class_stats, spectrum_query, upsert_spectrum_from_parsed, utcnow
 
@@ -40,15 +40,16 @@ class JobManager:
 
     def ensure_class_stats(self) -> None:
         with session_scope(self.session_factory) as session:
-            spectra_count = int(session.scalar(select(func.count()).select_from(Spectrum)) or 0)
-            stats_count = int(session.scalar(select(func.count()).select_from(ClassStat)) or 0)
+            spectra_exists = session.scalar(select(Spectrum.id).limit(1)) is not None
+            stats_exists = session.scalar(select(ClassStat.class_key).limit(1)) is not None
+            axis_stats_exists = session.scalar(select(ClassAxisStat.class_key).limit(1)) is not None
             running_job = session.scalar(
                 select(Job)
                 .where(Job.type == "maintenance", Job.status.in_(("pending", "running")))
                 .order_by(Job.created_at.desc())
                 .limit(1)
             )
-        if spectra_count > 0 and stats_count == 0 and running_job is None:
+        if spectra_exists and (not stats_exists or not axis_stats_exists) and running_job is None:
             self.create_class_stats_rebuild_job(reason="startup")
 
     def create_import_job(self, root_path: Path, recursive: bool = True) -> dict[str, Any]:

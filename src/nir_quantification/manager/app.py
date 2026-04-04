@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .api import create_router
 from .config import ManagerSettings
-from .db import create_session_factory, create_sqlite_engine, init_database
+from .db import create_session_factory, create_sqlite_engine, ensure_runtime_indexes, init_database
 from .jobs import JobManager
 from .parsers import ParserRegistry
 
@@ -17,6 +17,7 @@ def create_app(settings: ManagerSettings | None = None) -> FastAPI:
     settings = settings or ManagerSettings.from_env()
     engine = create_sqlite_engine(settings)
     init_database(engine)
+    ensure_runtime_indexes(engine)
     session_factory = create_session_factory(engine)
     parser_registry = ParserRegistry()
     job_manager = JobManager(settings=settings, session_factory=session_factory, parser_registry=parser_registry)

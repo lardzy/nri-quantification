@@ -39,6 +39,18 @@ def init_database(engine) -> None:
     Base.metadata.create_all(engine)
 
 
+def ensure_runtime_indexes(engine) -> None:
+    statements = [
+        "CREATE INDEX IF NOT EXISTS ix_spectra_class_excluded_axis_file ON spectra (class_key, is_excluded, axis_kind, file_name)",
+        "CREATE INDEX IF NOT EXISTS ix_spectra_class_excluded_file ON spectra (class_key, is_excluded, file_name)",
+        "CREATE INDEX IF NOT EXISTS ix_spectra_class_component_excluded_file ON spectra (class_key, component_count, is_excluded, file_name)",
+        "CREATE INDEX IF NOT EXISTS ix_spectra_excluded_recent ON spectra (is_excluded, excluded_at)",
+    ]
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.exec_driver_sql(statement)
+
+
 @contextmanager
 def session_scope(session_factory: sessionmaker[Session]) -> Iterator[Session]:
     session = session_factory()
