@@ -4,7 +4,7 @@ from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Select, case, delete, func, select
+from sqlalchemy import Select, case, delete, func, select, update
 from sqlalchemy.orm import Session
 
 from .db import decode_json, encode_json
@@ -237,6 +237,31 @@ def recompute_class_stats(session: Session, class_keys: Sequence[str] | None = N
             ]
         )
     return len(rows)
+
+
+def adjust_class_stats_for_exclusion(session: Session, spectrum: Spectrum, excluded: bool) -> None:
+    """Atomically adjust cached class counters for a single spectrum exclusion/restoration."""
+    delta = 1 if excluded else -1
+    session.execute(
+        update(ClassStat)
+        .where(ClassStat.class_key == spectrum.class_key)
+        .values(
+            active_count=ClassStat.active_count - delta,
+            excluded_count=ClassStat.excluded_count + delta,
+        )
+    )
+    session.execute(
+        update(ClassAxisStat)
+        .where(
+            ClassAxisStat.class_key == spectrum.class_key,
+            ClassAxisStat.axis_kind == spectrum.axis_kind,
+            ClassAxisStat.axis_unit == spectrum.axis_unit,
+        )
+        .values(
+            active_count=ClassAxisStat.active_count - delta,
+            excluded_count=ClassAxisStat.excluded_count + delta,
+        )
+    )
 
 
 def spectra_summary(

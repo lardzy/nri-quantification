@@ -17,12 +17,12 @@ from .db import decode_json, session_scope
 from .jobs import JobManager
 from .models import Job, Spectrum
 from .service import (
+    adjust_class_stats_for_exclusion,
     class_stats_status,
     fetch_recent_excluded,
     fetch_spectra,
     job_to_dict,
     list_classes,
-    recompute_class_stats,
     spectra_summary,
     spectrum_query,
     spectrum_to_dict,
@@ -207,8 +207,7 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
             raise HTTPException(status_code=404, detail="spectrum not found")
         spectrum.is_excluded = True
         spectrum.excluded_at = utcnow()
-        recompute_class_stats(session, [spectrum.class_key])
-        session.flush()
+        adjust_class_stats_for_exclusion(session, spectrum, excluded=True)
         return spectrum_to_dict(spectrum)
 
     @router.post("/spectra/{spectrum_id}/restore")
@@ -218,8 +217,7 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
             raise HTTPException(status_code=404, detail="spectrum not found")
         spectrum.is_excluded = False
         spectrum.excluded_at = None
-        recompute_class_stats(session, [spectrum.class_key])
-        session.flush()
+        adjust_class_stats_for_exclusion(session, spectrum, excluded=False)
         return spectrum_to_dict(spectrum)
 
     @router.post("/classes/{class_key:path}/subsets")
