@@ -53,6 +53,13 @@ const fourierSpectrum = {
   x_values: [3999.64, 4003.497, 4007.354]
 };
 
+const secondFourierSpectrum = {
+  ...fourierSpectrum,
+  id: 152,
+  file_name: "fourier-spectrum-2.csv",
+  source_path_last_seen: "/workspace/imports/fourier-spectrum-2.csv"
+};
+
 const secondSpectrum = {
   ...baseSpectrum,
   id: 202,
@@ -377,6 +384,78 @@ describe("App", () => {
       )
     );
     expect(await screen.findByRole("button", { name: baseSpectrum.file_name })).toBeInTheDocument();
+  });
+
+  it("keeps the selected wavenumber axis active after excluding one of multiple visible wavenumber spectra", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getSpectraSummary).mockImplementation(async ({ classKey, excluded: filter }) => {
+      if (classKey === secondClass.class_key) {
+        return {
+          status: "ready",
+          progress_message: null,
+          total_count: filter === "excluded" ? 0 : 1,
+          axis_summary: filter === "excluded" ? [] : wavelengthAxisSummary
+        };
+      }
+      return {
+        status: "ready",
+        progress_message: null,
+        total_count: filter === "all" ? 3 : filter === "excluded" ? 0 : 3,
+        axis_summary: [
+          { axis_kind: "wavelength", axis_unit: "nm", count: 1 },
+          { axis_kind: "wavenumber", axis_unit: "cm^-1", count: filter === "all" ? 2 : filter === "excluded" ? 0 : 2 }
+        ]
+      };
+    });
+    vi.mocked(api.getSpectra).mockImplementation(async ({ classKey, excluded: filter, axisKind, limit }) => {
+      if (classKey === secondClass.class_key) {
+        const items =
+          filter === "active" || filter === "all"
+            ? [{ ...secondSpectrum, is_excluded: false }]
+            : [];
+        return { items, count: items.length, limit: limit ?? 2000, axis_summary: wavelengthAxisSummary };
+      }
+
+      let items =
+        filter === "excluded"
+          ? []
+          : filter === "all"
+            ? [{ ...baseSpectrum, is_excluded: false }, { ...fourierSpectrum, is_excluded: false }, { ...secondFourierSpectrum, is_excluded: false }]
+            : [{ ...baseSpectrum, is_excluded: false }, { ...fourierSpectrum, is_excluded: false }, { ...secondFourierSpectrum, is_excluded: false }];
+      if (axisKind) {
+        items = items.filter((item) => item.axis_kind === axisKind);
+      }
+      return {
+        items,
+        count: filter === "all" ? 3 : items.length,
+        limit: limit ?? 2000,
+        axis_summary:
+          axisKind === "wavenumber"
+            ? [{ axis_kind: "wavenumber", axis_unit: "cm^-1", count: 2 }]
+            : axisKind === "wavelength"
+              ? wavelengthAxisSummary
+              : [
+                  { axis_kind: "wavelength", axis_unit: "nm", count: 1 },
+                  { axis_kind: "wavenumber", axis_unit: "cm^-1", count: 2 }
+                ]
+      };
+    });
+    vi.mocked(api.excludeSpectrum).mockImplementation(async (id: number) => {
+      if (id === fourierSpectrum.id) {
+        return { ...fourierSpectrum, is_excluded: true };
+      }
+      return { ...baseSpectrum, is_excluded: true };
+    });
+    render(<App />);
+
+    await user.click(await screen.findByText("波数 (cm^-1) (2)"));
+    const quickExcludeButton = await screen.findByRole("button", { name: `quick-exclude-${fourierSpectrum.file_name}` });
+
+    await user.click(quickExcludeButton);
+    await waitFor(() => expect(api.excludeSpectrum).toHaveBeenCalledWith(fourierSpectrum.id));
+
+    expect(await screen.findByRole("button", { name: secondFourierSpectrum.file_name })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: baseSpectrum.file_name })).not.toBeInTheDocument();
   });
 
   it("shows an initialization hint instead of a blank page while class stats are building", async () => {

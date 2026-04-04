@@ -374,6 +374,7 @@ function Workspace() {
     return classes.filter((item) => !keyword || item.class_display_name.includes(keyword));
   }, [classes, deferredClassSearch]);
   const previewSpectra = useMemo(() => spectra, [spectra]);
+  const selectedClassKey = selectedClass?.class_key;
   const selectedClassLabel = selectedClass?.class_display_name ?? "未选择分类";
   const selectedAxisSummary = axisSummary.find((item) => item.axis_kind === selectedAxisKind);
   const selectedAxisLabel = selectedAxisSummary
@@ -770,7 +771,12 @@ function Workspace() {
     if (currentItem) {
       currentItem.count += delta;
       if (currentItem.count <= 0) {
-        nextMap.delete(key);
+        if (selectedAxisKind === currentItem.axis_kind) {
+          currentItem.count = 0;
+          nextMap.set(key, currentItem);
+        } else {
+          nextMap.delete(key);
+        }
       } else {
         nextMap.set(key, currentItem);
       }
@@ -1022,7 +1028,7 @@ function Workspace() {
       return;
     }
     void loadPreviewSummary(selectedClass, excludedFilter, activeSubsetId);
-  }, [activeSubsetId, excludedFilter, isScreenTooSmall, selectedClass]);
+  }, [activeSubsetId, excludedFilter, isScreenTooSmall, selectedClassKey]);
 
   useEffect(() => {
     if (isScreenTooSmall || !selectedClass || !selectedAxisKind) {
