@@ -3,6 +3,7 @@ import * as echarts from "echarts";
 import type { EChartsType } from "echarts";
 import { Tag } from "antd";
 import {
+  buildHitTestSpectra,
   findNearestSpectrumHit,
   formatAxisValue,
   formatSpectrumLabels,
@@ -10,6 +11,7 @@ import {
   getSpectraExtents,
   shiftZoomWindow
 } from "./chartInteraction";
+import type { HitTestSpectrum } from "./chartInteraction";
 import type { SpectrumItem } from "./types";
 
 type HoverPreview = {
@@ -21,9 +23,8 @@ type HoverPreview = {
 type Props = {
   spectra: SpectrumItem[];
   resetSignal: number;
-  hoveredSpectrumId: number | null;
   lockedSpectrumId: number | null;
-  onHoverSpectrum: (spectrum: SpectrumItem | null) => void;
+  interactionMode: "full" | "medium" | "dense";
   onLockSpectrum: (spectrum: SpectrumItem | null) => void;
   onQuickExclude: (spectrum: SpectrumItem) => void;
 };
@@ -61,9 +62,8 @@ function readZoomWindowFromOption(option: {
 export function SpectrumChart({
   spectra,
   resetSignal,
-  hoveredSpectrumId,
   lockedSpectrumId,
-  onHoverSpectrum,
+  interactionMode,
   onLockSpectrum,
   onQuickExclude
 }: Props) {
@@ -71,12 +71,12 @@ export function SpectrumChart({
   const chartRef = useRef<EChartsType | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const latestPointerRef = useRef<{ x: number; y: number } | null>(null);
-  const spectraRef = useRef<SpectrumItem[]>(spectra);
-  const hoverCallbackRef = useRef(onHoverSpectrum);
+  const hitTestSpectraRef = useRef<HitTestSpectrum[]>([]);
   const lockCallbackRef = useRef(onLockSpectrum);
   const quickExcludeCallbackRef = useRef(onQuickExclude);
   const optionRef = useRef<Record<string, unknown> | null>(null);
   const zoomWindowRef = useRef<ZoomWindow>(DEFAULT_ZOOM_WINDOW);
+  const lastHoverAtRef = useRef(0);
   const panStateRef = useRef<{
     startPixel: { x: number; y: number };
     startZoom: ZoomWindow;
@@ -86,14 +86,7 @@ export function SpectrumChart({
   } | null>(null);
   const ignoreNextClickRef = useRef(false);
   const [preview, setPreview] = useState<HoverPreview | null>(null);
-
-  useEffect(() => {
-    spectraRef.current = spectra;
-  }, [spectra]);
-
-  useEffect(() => {
-    hoverCallbackRef.current = onHoverSpectrum;
-  }, [onHoverSpectrum]);
+  const [hoveredSpectrumId, setHoveredSpectrumId] = useState<number | null>(null);
 
   useEffect(() => {
     lockCallbackRef.current = onLockSpectrum;
@@ -103,8 +96,20 @@ export function SpectrumChart({
     quickExcludeCallbackRef.current = onQuickExclude;
   }, [onQuickExclude]);
 
-  const activeSpectrumId = hoveredSpectrumId ?? lockedSpectrumId;
+  const hitTestSpectra = useMemo(() => buildHitTestSpectra(spectra, 512), [spectra]);
   const axisExtents = useMemo(() => getSpectraExtents(spectra), [spectra]);
+  const activeSpectrumId = interactionMode === "full" ? hoveredSpectrumId ?? lockedSpectrumId : lockedSpectrumId;
+
+  useEffect(() => {
+    hitTestSpectraRef.current = hitTestSpectra;
+  }, [hitTestSpectra]);
+
+  useEffect(() => {
+    if (interactionMode === "dense") {
+      setPreview(null);
+      setHoveredSpectrumId(null);
+    }
+  }, [interactionMode]);
 
   const option = useMemo(() => {
     const yLabelRich = {
@@ -195,10 +200,12 @@ export function SpectrumChart({
           name: spectrum.file_name,
           showSymbol: false,
           sampling: "lttb",
+          progressive: 300,
+          progressiveThreshold: 600,
           silent: true,
           lineStyle: {
             width: isActive ? 2.6 : 1.1,
-            opacity: isActive ? 0.98 : spectrum.is_excluded ? 0.14 : 0.26
+            opacity: isActive ? 0.98 : spectrum.is_excluded ? 0.14 : 0.24
           },
           z: isActive ? 10 : 2,
           data: spectrum.x_values.map((xValue, pointIndex) => [xValue, spectrum.y_values[pointIndex]]),
@@ -222,7 +229,7 @@ export function SpectrumChart({
 
     const clearHover = () => {
       setPreview(null);
-      hoverCallbackRef.current(null);
+      setHoveredSpectrumId(null);
       if (animationFrameRef.current !== null) {
         cancelAnimationFrame(animationFrameRef.current);
         animationFrameRef.current = null;
@@ -268,7 +275,7 @@ export function SpectrumChart({
 
       const yThreshold = Math.max(Math.abs((thresholdPoint?.[1] ?? dataPoint[1]) - dataPoint[1]), 0.0025);
       return findNearestSpectrumHit({
-        spectra: spectraRef.current,
+        spectra: hitTestSpectraRef.current,
         xValue: dataPoint[0],
         yValue: dataPoint[1],
         yThreshold
@@ -291,13 +298,17 @@ export function SpectrumChart({
     const updateHover = () => {
       animationFrameRef.current = null;
       const pointer = latestPointerRef.current;
+      if (interactionMode === "dense") {
+        clearHover();
+        return;
+      }
       const hit = resolveHitAtPointer(pointer);
       if (!pointer || !hit) {
         clearHover();
         return;
       }
 
-      hoverCallbackRef.current(hit.spectrum);
+      setHoveredSpectrumId(hit.spectrum.id);
       setPreview({
         spectrum: hit.spectrum,
         left: pointer.x + 16,
@@ -306,6 +317,14 @@ export function SpectrumChart({
     };
 
     const scheduleHover = (x: number, y: number) => {
+      if (interactionMode === "dense") {
+        return;
+      }
+      const now = performance.now();
+      if (interactionMode === "medium" && now - lastHoverAtRef.current < 50) {
+        return;
+      }
+      lastHoverAtRef.current = now;
       latestPointerRef.current = { x, y };
       if (animationFrameRef.current !== null) {
         return;
@@ -326,16 +345,8 @@ export function SpectrumChart({
         const ySpan = axisExtents.yExtent[1] - axisExtents.yExtent[0];
         const xDeltaPercent = xSpan > 0 ? (deltaX / xSpan) * 100 : 0;
         const yDeltaPercent = ySpan > 0 ? (deltaY / ySpan) * 100 : 0;
-        const [nextXStart, nextXEnd] = shiftZoomWindow(
-          panState.startZoom.xStart,
-          panState.startZoom.xEnd,
-          xDeltaPercent
-        );
-        const [nextYStart, nextYEnd] = shiftZoomWindow(
-          panState.startZoom.yStart,
-          panState.startZoom.yEnd,
-          yDeltaPercent
-        );
+        const [nextXStart, nextXEnd] = shiftZoomWindow(panState.startZoom.xStart, panState.startZoom.xEnd, xDeltaPercent);
+        const [nextYStart, nextYEnd] = shiftZoomWindow(panState.startZoom.yStart, panState.startZoom.yEnd, yDeltaPercent);
         panState.moved =
           panState.moved ||
           Math.abs(event.offsetX - panState.startPixel.x) > 2 ||
@@ -416,7 +427,7 @@ export function SpectrumChart({
       chart.dispose();
       chartRef.current = null;
     };
-  }, [axisExtents.xExtent, axisExtents.yExtent]);
+  }, [axisExtents.xExtent, axisExtents.yExtent, interactionMode]);
 
   useEffect(() => {
     if (chartRef.current) {
@@ -434,13 +445,15 @@ export function SpectrumChart({
     if (chartRef.current && optionRef.current) {
       chartRef.current.setOption(optionRef.current, true);
       zoomWindowRef.current = DEFAULT_ZOOM_WINDOW;
+      setPreview(null);
+      setHoveredSpectrumId(null);
     }
   }, [resetSignal]);
 
   return (
     <div className="chart-shell">
       <div className="chart-surface" ref={containerRef} />
-      {preview && (
+      {preview && interactionMode !== "dense" && (
         <div
           className="chart-hover-card"
           style={{

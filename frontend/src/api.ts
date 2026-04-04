@@ -1,4 +1,4 @@
-import type { AxisKind, AxisSummary, BrowseResponse, JobItem, SpectrumClass, SpectrumItem, SubsetSummary } from "./types";
+import type { AxisKind, AxisSummary, BrowseResponse, JobItem, LoadingMeta, SpectrumClass, SpectrumItem, SpectrumSummary, SubsetSummary } from "./types";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -36,9 +36,25 @@ export const api = {
     const data = await request<{ items: JobItem[] }>("/api/jobs?limit=20");
     return data.items;
   },
-  async getClasses(sort: "count" | "component_count" | "name"): Promise<SpectrumClass[]> {
-    const data = await request<{ items: SpectrumClass[] }>(`/api/classes?sort=${sort}`);
-    return data.items;
+  async getClasses(
+    sort: "count" | "component_count" | "name",
+    options?: { signal?: AbortSignal }
+  ): Promise<{ items: SpectrumClass[]; meta: LoadingMeta }> {
+    return request<{ items: SpectrumClass[]; meta: LoadingMeta }>(`/api/classes?sort=${sort}`, { signal: options?.signal });
+  },
+  async getSpectraSummary(
+    params: {
+      classKey?: string;
+      excluded: "active" | "excluded" | "all";
+      subsetId?: string;
+    },
+    options?: { signal?: AbortSignal }
+  ): Promise<SpectrumSummary> {
+    const query = new URLSearchParams();
+    if (params.classKey) query.set("class_key", params.classKey);
+    if (params.subsetId) query.set("subset_id", params.subsetId);
+    query.set("excluded", params.excluded);
+    return request(`/api/spectra/summary?${query.toString()}`, { signal: options?.signal });
   },
   async getSpectra(params: {
     classKey?: string;
@@ -46,14 +62,14 @@ export const api = {
     axisKind?: AxisKind;
     subsetId?: string;
     limit?: number;
-  }): Promise<{ items: SpectrumItem[]; count: number; limit: number; axis_summary: AxisSummary[] }> {
+  }, options?: { signal?: AbortSignal }): Promise<{ items: SpectrumItem[]; count: number; limit: number; axis_summary: AxisSummary[] }> {
     const query = new URLSearchParams();
     if (params.classKey) query.set("class_key", params.classKey);
     if (params.axisKind) query.set("axis_kind", params.axisKind);
     if (params.subsetId) query.set("subset_id", params.subsetId);
     query.set("excluded", params.excluded);
     query.set("limit", String(params.limit ?? 500));
-    return request(`/api/spectra?${query.toString()}`);
+    return request(`/api/spectra?${query.toString()}`, { signal: options?.signal });
   },
   async excludeSpectrum(id: number): Promise<SpectrumItem> {
     return request(`/api/spectra/${id}/exclude`, { method: "POST" });

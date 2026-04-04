@@ -15,6 +15,7 @@ import {
   Progress,
   Segmented,
   Select,
+  Skeleton,
   Space,
   Spin,
   Statistic,
@@ -40,7 +41,7 @@ import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState
 import { api, subscribeJob } from "./api";
 import { formatSpectrumLabels, getAxisDisplayLabel } from "./chartInteraction";
 import { SpectrumChart } from "./SpectrumChart";
-import type { AxisKind, AxisSummary, FsEntry, JobItem, SpectrumClass, SpectrumItem, SubsetSummary } from "./types";
+import type { AxisKind, AxisSummary, FsEntry, JobItem, LoadingMeta, SpectrumClass, SpectrumItem, SubsetSummary } from "./types";
 import "./styles.css";
 
 const { Content, Sider } = Layout;
@@ -57,12 +58,13 @@ type PathChooserProps = {
   onAction: () => Promise<void>;
 };
 
-type ChartInteractionState = {
-  hoveredSpectrum: SpectrumItem | null;
-  lockedSpectrum: SpectrumItem | null;
-};
-
 type ExportScope = "active" | "excluded" | "all";
+
+type PreviewLoadState = {
+  active: boolean;
+  percent: number;
+  message: string;
+};
 
 const EXPORT_SCOPE_LABELS: Record<ExportScope, string> = {
   active: "未剔除",
@@ -82,6 +84,10 @@ function sortAxisSummary(summary: AxisSummary[]): AxisSummary[] {
 
 function pickPreferredAxisKind(summary: AxisSummary[]): AxisKind | undefined {
   return sortAxisSummary(summary)[0]?.axis_kind;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 function useViewportWidth() {
@@ -303,6 +309,10 @@ function Workspace() {
   const isScreenTooSmall = viewportWidth < 1280;
 
   const [classes, setClasses] = useState<SpectrumClass[]>([]);
+  const [classesMeta, setClassesMeta] = useState<LoadingMeta>({ status: "ready", progress_message: null });
+  const [loadingClasses, setLoadingClasses] = useState(true);
+  const [loadingJobs, setLoadingJobs] = useState(true);
+  const [loadingRecentExcluded, setLoadingRecentExcluded] = useState(true);
   const [classSort, setClassSort] = useState<"count" | "component_count" | "name">("count");
   const [classSearch, setClassSearch] = useState("");
   const deferredClassSearch = useDeferredValue(classSearch);
@@ -319,204 +329,217 @@ function Workspace() {
   const [activeSubsetId, setActiveSubsetId] = useState<string | undefined>();
   const [axisSummary, setAxisSummary] = useState<AxisSummary[]>([]);
   const [selectedAxisKind, setSelectedAxisKind] = useState<AxisKind | undefined>();
-  const [loadingSpectra, setLoadingSpectra] = useState(false);
   const [spectraTotal, setSpectraTotal] = useState(0);
+  const [previewLoad, setPreviewLoad] = useState<PreviewLoadState>({ active: false, percent: 0, message: "" });
+  const [previewLimitMessage, setPreviewLimitMessage] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [exportSelectedOnly, setExportSelectedOnly] = useState(true);
-  const [hoveredSpectrumId, setHoveredSpectrumId] = useState<number | null>(null);
-  const [lockedSpectrumId, setLockedSpectrumId] = useState<number | null>(null);
-  const [chartInteractionState, setChartInteractionState] = useState<ChartInteractionState>({
-    hoveredSpectrum: null,
-    lockedSpectrum: null
-  });
+  const [lockedSpectrum, setLockedSpectrum] = useState<SpectrumItem | null>(null);
   const [pendingUndoSpectrum, setPendingUndoSpectrum] = useState<SpectrumItem | null>(null);
   const [chartResetToken, setChartResetToken] = useState(0);
   const [leftPanelVisible, setLeftPanelVisible] = useState(true);
   const [rightPanelVisible, setRightPanelVisible] = useState(true);
   const subscriptionsRef = useRef<Map<number, () => void>>(new Map());
-  const loadRequestIdRef = useRef(0);
+  const classesAbortRef = useRef<AbortController | null>(null);
+  const summaryAbortRef = useRef<AbortController | null>(null);
+  const detailAbortRef = useRef<AbortController | null>(null);
+  const pollTimeoutRef = useRef<number | null>(null);
+  const previewTokenRef = useRef(0);
 
-  const canRender = spectraTotal <= 2000;
   const filteredClasses = useMemo(() => {
     const keyword = deferredClassSearch.trim();
     return classes.filter((item) => !keyword || item.class_display_name.includes(keyword));
   }, [classes, deferredClassSearch]);
   const previewSpectra = useMemo(() => spectra, [spectra]);
-
-  const detailSpectrum = chartInteractionState.lockedSpectrum ?? pendingUndoSpectrum;
-  const detailModeLabel = chartInteractionState.lockedSpectrum ? "已锁定" : pendingUndoSpectrum ? "最近操作" : null;
   const selectedClassLabel = selectedClass?.class_display_name ?? "未选择分类";
   const selectedAxisSummary = axisSummary.find((item) => item.axis_kind === selectedAxisKind);
   const selectedAxisLabel = selectedAxisSummary
     ? getAxisDisplayLabel(selectedAxisSummary.axis_kind, selectedAxisSummary.axis_unit)
     : null;
+  const currentAxisCount = selectedAxisSummary?.count ?? 0;
+  const canRender = currentAxisCount <= 2000;
+  const chartDensityMode = previewSpectra.length > 800 ? "dense" : previewSpectra.length > 200 ? "medium" : "full";
+  const detailSpectrum = lockedSpectrum ?? pendingUndoSpectrum;
+  const detailModeLabel = lockedSpectrum ? "已锁定" : pendingUndoSpectrum ? "最近操作" : null;
 
-  useEffect(() => {
-    if (isScreenTooSmall) {
-      return;
-    }
-    void refreshClasses();
-  }, [classSort, isScreenTooSmall]);
+  function cancelClassRequest() {
+    classesAbortRef.current?.abort();
+    classesAbortRef.current = null;
+  }
 
-  useEffect(() => {
-    if (isScreenTooSmall) {
-      return;
-    }
-    api.recentExcluded().then(setRecentExcluded).catch((error) => setErrorText(String(error)));
-    api.listJobs().then(setJobs).catch((error) => setErrorText(String(error)));
-    return () => {
-      subscriptionsRef.current.forEach((unsubscribe) => unsubscribe());
-      subscriptionsRef.current.clear();
-    };
-  }, [isScreenTooSmall]);
+  function cancelPreviewRequests() {
+    summaryAbortRef.current?.abort();
+    summaryAbortRef.current = null;
+    detailAbortRef.current?.abort();
+    detailAbortRef.current = null;
+  }
 
-  useEffect(() => {
-    if (isScreenTooSmall) {
-      return;
-    }
-    if (!selectedClass) {
-      loadRequestIdRef.current += 1;
-      startTransition(() => {
-        setSpectra([]);
-        setSpectraTotal(0);
-        setAxisSummary([]);
-        setSelectedAxisKind(undefined);
-      });
-      setLoadingSpectra(false);
-      return;
-    }
-    startTransition(() => {
-      setSpectra([]);
-      setSpectraTotal(0);
+  function clearPreviewState(resetAxisSelection: boolean) {
+    cancelPreviewRequests();
+    previewTokenRef.current += 1;
+    setSpectra([]);
+    setSpectraTotal(0);
+    setPreviewLoad({ active: false, percent: 0, message: "" });
+    setPreviewLimitMessage(null);
+    setLockedSpectrum(null);
+    if (resetAxisSelection) {
       setAxisSummary([]);
       setSelectedAxisKind(undefined);
-    });
-    void probeAxisSummary(selectedClass, excludedFilter, activeSubsetId);
-  }, [activeSubsetId, excludedFilter, isScreenTooSmall, selectedClass]);
-
-  useEffect(() => {
-    if (isScreenTooSmall || !selectedClass || !selectedAxisKind) {
-      return;
     }
-    startTransition(() => {
-      setSpectra([]);
-      setSpectraTotal(0);
-    });
-    void loadSpectra(selectedClass, excludedFilter, activeSubsetId, selectedAxisKind);
-  }, [activeSubsetId, excludedFilter, isScreenTooSmall, selectedAxisKind, selectedClass]);
+  }
 
-  useEffect(() => {
-    setChartInteractionState((current) => ({
-      hoveredSpectrum: current.hoveredSpectrum ? spectra.find((item) => item.id === current.hoveredSpectrum?.id) ?? null : null,
-      lockedSpectrum: current.lockedSpectrum ? spectra.find((item) => item.id === current.lockedSpectrum?.id) ?? null : null
-    }));
-
-    if (hoveredSpectrumId !== null && !spectra.some((item) => item.id === hoveredSpectrumId)) {
-      setHoveredSpectrumId(null);
+  async function refreshClasses(options?: { silent?: boolean }) {
+    cancelClassRequest();
+    const controller = new AbortController();
+    classesAbortRef.current = controller;
+    if (!options?.silent || classes.length === 0) {
+      setLoadingClasses(true);
     }
-    if (lockedSpectrumId !== null && !spectra.some((item) => item.id === lockedSpectrumId)) {
-      setLockedSpectrumId(null);
-    }
-  }, [hoveredSpectrumId, lockedSpectrumId, spectra]);
-
-  async function refreshClasses() {
-    const next = await api.getClasses(classSort);
-    startTransition(() => {
-      setClasses(next);
-      if (selectedClass) {
-        const replacement = next.find((item) => item.class_key === selectedClass.class_key) ?? null;
-        setSelectedClass(replacement ?? next[0] ?? null);
-      } else {
-        setSelectedClass((current) => current ?? next[0] ?? null);
+    try {
+      const data = await api.getClasses(classSort, { signal: controller.signal });
+      startTransition(() => {
+        setClasses(data.items);
+        setClassesMeta(data.meta);
+        setSelectedClass((current) => {
+          if (current) {
+            return data.items.find((item) => item.class_key === current.class_key) ?? data.items[0] ?? null;
+          }
+          return data.items[0] ?? null;
+        });
+      });
+    } catch (error) {
+      if (!isAbortError(error)) {
+        setErrorText(String(error));
       }
-    });
+    } finally {
+      if (classesAbortRef.current === controller) {
+        classesAbortRef.current = null;
+        setLoadingClasses(false);
+      }
+    }
   }
 
   async function refreshExcluded() {
-    const items = await api.recentExcluded();
-    startTransition(() => setRecentExcluded(items));
+    setLoadingRecentExcluded(true);
+    try {
+      const items = await api.recentExcluded();
+      startTransition(() => setRecentExcluded(items));
+    } catch (error) {
+      setErrorText(String(error));
+    } finally {
+      setLoadingRecentExcluded(false);
+    }
   }
 
-  async function probeAxisSummary(
+  async function refreshJobs() {
+    setLoadingJobs(true);
+    try {
+      const items = await api.listJobs();
+      startTransition(() => setJobs(items));
+    } catch (error) {
+      setErrorText(String(error));
+    } finally {
+      setLoadingJobs(false);
+    }
+  }
+
+  async function loadPreviewSummary(
     targetClass: SpectrumClass,
     targetFilter: "active" | "excluded" | "all",
-    subsetId: string | undefined
+    subsetId: string | undefined,
+    preferredAxisKind?: AxisKind
   ) {
-    const requestId = loadRequestIdRef.current + 1;
-    loadRequestIdRef.current = requestId;
-    setLoadingSpectra(true);
+    cancelPreviewRequests();
+    const controller = new AbortController();
+    summaryAbortRef.current = controller;
+    const previewToken = previewTokenRef.current;
+    setPreviewLoad({ active: true, percent: 20, message: "正在查询分类摘要..." });
+    setPreviewLimitMessage(null);
     try {
-      const data = await api.getSpectra({
-        classKey: targetClass.class_key,
-        excluded: targetFilter,
-        subsetId,
-        limit: 1
-      });
-      if (requestId !== loadRequestIdRef.current) {
+      const data = await api.getSpectraSummary(
+        {
+          classKey: targetClass.class_key,
+          excluded: targetFilter,
+          subsetId,
+        },
+        { signal: controller.signal }
+      );
+      if (previewToken !== previewTokenRef.current) {
         return;
       }
       const nextAxisSummary = sortAxisSummary(data.axis_summary);
+      const nextSelectedAxisKind =
+        preferredAxisKind && nextAxisSummary.some((item) => item.axis_kind === preferredAxisKind)
+          ? preferredAxisKind
+          : pickPreferredAxisKind(nextAxisSummary);
       startTransition(() => {
         setAxisSummary(nextAxisSummary);
-        setSelectedAxisKind(pickPreferredAxisKind(nextAxisSummary));
+        setSelectedAxisKind(nextSelectedAxisKind);
+        setSpectraTotal(data.total_count);
       });
-    } catch (error) {
-      if (requestId !== loadRequestIdRef.current) {
+
+      if (nextAxisSummary.length === 0) {
+        setPreviewLoad({ active: false, percent: 100, message: "" });
         return;
       }
-      setErrorText(String(error));
+      setPreviewLoad({
+        active: true,
+        percent: 50,
+        message: data.progress_message || "摘要分析完成，正在准备光谱明细..."
+      });
+    } catch (error) {
+      if (!isAbortError(error)) {
+        setPreviewLoad({ active: false, percent: 0, message: "" });
+        setErrorText(String(error));
+      }
     } finally {
-      if (requestId === loadRequestIdRef.current) {
-        setLoadingSpectra(false);
+      if (summaryAbortRef.current === controller) {
+        summaryAbortRef.current = null;
       }
     }
   }
 
-  async function loadSpectra(
+  async function loadPreviewDetail(
     targetClass: SpectrumClass,
     targetFilter: "active" | "excluded" | "all",
     subsetId: string | undefined,
     axisKind: AxisKind
   ) {
-    const requestId = loadRequestIdRef.current + 1;
-    loadRequestIdRef.current = requestId;
-    setLoadingSpectra(true);
+    detailAbortRef.current?.abort();
+    const controller = new AbortController();
+    detailAbortRef.current = controller;
+    setPreviewLoad({ active: true, percent: 60, message: "正在读取光谱明细..." });
     try {
-      const data = await api.getSpectra({
-        classKey: targetClass.class_key,
-        excluded: targetFilter,
-        axisKind,
-        subsetId,
-        limit: 2000
-      });
-      if (requestId !== loadRequestIdRef.current) {
-        return;
-      }
-      const nextAxisSummary = sortAxisSummary(data.axis_summary);
-      if (!nextAxisSummary.some((item) => item.axis_kind === axisKind)) {
-        startTransition(() => {
-          setAxisSummary(nextAxisSummary);
-          setSelectedAxisKind(pickPreferredAxisKind(nextAxisSummary));
-          setSpectra([]);
-          setSpectraTotal(0);
-        });
-        return;
-      }
-      startTransition(() => {
-        setAxisSummary(nextAxisSummary);
-        setSpectra(data.items);
-        setSpectraTotal(data.count);
-      });
+      const data = await api.getSpectra(
+        {
+          classKey: targetClass.class_key,
+          excluded: targetFilter,
+          axisKind,
+          subsetId,
+          limit: 2000,
+        },
+        { signal: controller.signal }
+      );
+      startTransition(() => setSpectra(data.items));
+      setPreviewLoad({ active: false, percent: 100, message: "" });
     } catch (error) {
-      if (requestId !== loadRequestIdRef.current) {
-        return;
+      if (!isAbortError(error)) {
+        setPreviewLoad({ active: false, percent: 0, message: "" });
+        setErrorText(String(error));
       }
-      setErrorText(String(error));
     } finally {
-      if (requestId === loadRequestIdRef.current) {
-        setLoadingSpectra(false);
+      if (detailAbortRef.current === controller) {
+        detailAbortRef.current = null;
       }
     }
+  }
+
+  async function reloadPreview(preferredAxisKind?: AxisKind) {
+    if (!selectedClass || isScreenTooSmall) {
+      return;
+    }
+    clearPreviewState(true);
+    await loadPreviewSummary(selectedClass, excludedFilter, activeSubsetId, preferredAxisKind);
   }
 
   function trackJob(job: JobItem) {
@@ -528,7 +551,7 @@ function Workspace() {
         subscriptionsRef.current.delete(job.id);
       }
       if (next.status === "completed" && next.type === "import") {
-        void refreshClasses();
+        void refreshClasses({ silent: true });
         void refreshExcluded();
       }
     });
@@ -576,23 +599,10 @@ function Workspace() {
     try {
       const restored = await api.restoreSpectrum(spectrum.id);
       setPendingUndoSpectrum(null);
-      setHoveredSpectrumId((current) => (current === restored.id ? null : current));
-      if (lockedSpectrumId === restored.id) {
-        setLockedSpectrumId(restored.id);
-      }
-      setChartInteractionState((current) => ({
-        hoveredSpectrum: current.hoveredSpectrum?.id === restored.id ? null : current.hoveredSpectrum,
-        lockedSpectrum: current.lockedSpectrum?.id === restored.id ? restored : current.lockedSpectrum
-      }));
-      await refreshClasses();
+      setLockedSpectrum((current) => (current?.id === restored.id ? restored : current));
+      await refreshClasses({ silent: true });
       await refreshExcluded();
-      if (selectedClass && !isScreenTooSmall) {
-        if (selectedAxisKind) {
-          await loadSpectra(selectedClass, excludedFilter, activeSubsetId, selectedAxisKind);
-        } else {
-          await probeAxisSummary(selectedClass, excludedFilter, activeSubsetId);
-        }
-      }
+      await reloadPreview(selectedAxisKind);
       messageApi.success(`已恢复 ${restored.file_name}`);
     } catch (error) {
       const messageText = String(error);
@@ -607,9 +617,7 @@ function Workspace() {
         return;
       }
       const updated = await api.excludeSpectrum(spectrum.id);
-      setLockedSpectrumId(null);
-      setHoveredSpectrumId(null);
-      setChartInteractionState({ hoveredSpectrum: null, lockedSpectrum: null });
+      setLockedSpectrum(null);
       setPendingUndoSpectrum(updated);
       startTransition(() => {
         setSpectra((current) =>
@@ -617,19 +625,10 @@ function Workspace() {
             ? current.filter((item) => item.id !== updated.id)
             : current.map((item) => (item.id === updated.id ? updated : item))
         );
-        if (excludedFilter === "active") {
-          setSpectraTotal((current) => Math.max(0, current - 1));
-        }
       });
-      await refreshClasses();
+      await refreshClasses({ silent: true });
       await refreshExcluded();
-      if (selectedClass && !isScreenTooSmall) {
-        if (selectedAxisKind) {
-          await loadSpectra(selectedClass, excludedFilter, activeSubsetId, selectedAxisKind);
-        } else {
-          await probeAxisSummary(selectedClass, excludedFilter, activeSubsetId);
-        }
-      }
+      await reloadPreview(selectedAxisKind);
 
       const notificationKey = `exclude-${updated.id}`;
       notificationApi.open({
@@ -665,8 +664,7 @@ function Workspace() {
   }
 
   function clearLockedSpectrum() {
-    setLockedSpectrumId(null);
-    setChartInteractionState((current) => ({ ...current, lockedSpectrum: null }));
+    setLockedSpectrum(null);
   }
 
   async function createSubsets() {
@@ -689,27 +687,98 @@ function Workspace() {
   }
 
   function closeSubsets() {
+    const shouldReload = activeSubsetId === undefined && subsets.length > 0;
+    setSubsets([]);
+    setActiveSubsetId(undefined);
+    setChartResetToken((current) => current + 1);
+    if (shouldReload) {
+      void reloadPreview(selectedAxisKind);
+    }
+  }
+
+  useEffect(() => {
+    if (isScreenTooSmall) {
+      return;
+    }
+    void refreshClasses();
+  }, [classSort, isScreenTooSmall]);
+
+  useEffect(() => {
+    if (isScreenTooSmall) {
+      return;
+    }
+    void refreshJobs();
+    void refreshExcluded();
+    return () => {
+      cancelClassRequest();
+      cancelPreviewRequests();
+      if (pollTimeoutRef.current !== null) {
+        window.clearTimeout(pollTimeoutRef.current);
+      }
+      subscriptionsRef.current.forEach((unsubscribe) => unsubscribe());
+      subscriptionsRef.current.clear();
+    };
+  }, [isScreenTooSmall]);
+
+  useEffect(() => {
+    if (isScreenTooSmall || classesMeta.status !== "building") {
+      if (pollTimeoutRef.current !== null) {
+        window.clearTimeout(pollTimeoutRef.current);
+        pollTimeoutRef.current = null;
+      }
+      return;
+    }
+    pollTimeoutRef.current = window.setTimeout(() => {
+      void refreshClasses({ silent: true });
+      void refreshJobs();
+    }, 1500);
+    return () => {
+      if (pollTimeoutRef.current !== null) {
+        window.clearTimeout(pollTimeoutRef.current);
+        pollTimeoutRef.current = null;
+      }
+    };
+  }, [classesMeta.status, classSort, isScreenTooSmall]);
+
+  useEffect(() => {
+    if (isScreenTooSmall) {
+      return;
+    }
+    clearPreviewState(true);
     if (!selectedClass) {
       return;
     }
-    const needsManualReload = activeSubsetId === undefined;
-    loadRequestIdRef.current += 1;
-    setLoadingSpectra(true);
-    setSubsets([]);
-    setActiveSubsetId(undefined);
-    setHoveredSpectrumId(null);
-    setLockedSpectrumId(null);
-    setPendingUndoSpectrum(null);
-    setSpectra([]);
-    setSpectraTotal(0);
-    setAxisSummary([]);
-    setSelectedAxisKind(undefined);
-    setChartInteractionState({ hoveredSpectrum: null, lockedSpectrum: null });
-    setChartResetToken((current) => current + 1);
-    if (needsManualReload) {
-      void probeAxisSummary(selectedClass, excludedFilter, undefined);
+    void loadPreviewSummary(selectedClass, excludedFilter, activeSubsetId);
+  }, [activeSubsetId, excludedFilter, isScreenTooSmall, selectedClass]);
+
+  useEffect(() => {
+    if (isScreenTooSmall || !selectedClass || !selectedAxisKind) {
+      return;
     }
-  }
+    const nextAxisSummary = axisSummary.find((item) => item.axis_kind === selectedAxisKind);
+    if (!nextAxisSummary) {
+      return;
+    }
+    setSpectra([]);
+    if (nextAxisSummary.count > 2000) {
+      setPreviewLoad({ active: false, percent: 50, message: "" });
+      setPreviewLimitMessage(
+        `当前${getAxisDisplayLabel(nextAxisSummary.axis_kind, nextAxisSummary.axis_unit)}共有 ${nextAxisSummary.count} 条，超过 2000 条渲染上限，请先生成子集。`
+      );
+      return;
+    }
+    setPreviewLimitMessage(null);
+    void loadPreviewDetail(selectedClass, excludedFilter, activeSubsetId, selectedAxisKind);
+  }, [activeSubsetId, axisSummary, excludedFilter, isScreenTooSmall, selectedAxisKind, selectedClass]);
+
+  useEffect(() => {
+    setLockedSpectrum((current) => {
+      if (!current) {
+        return null;
+      }
+      return spectra.find((item) => item.id === current.id) ?? null;
+    });
+  }, [spectra]);
 
   const rightPanel = (
     <div className="workspace-panel-stack">
@@ -738,61 +807,69 @@ function Workspace() {
 
       <Card title="后台任务" size="small" className="scroll-card">
         <div className="scroll-list-wrap jobs-list-wrap">
-          <List
-            dataSource={jobs}
-            locale={{ emptyText: "暂无任务" }}
-            renderItem={(job) => {
-              const progress = job.total_discovered > 0 ? Math.round((job.processed_count / job.total_discovered) * 100) : job.status === "completed" ? 100 : 0;
-              return (
-                <List.Item>
-                  <div className="job-item">
-                    <div className="job-item-head">
-                      <Text strong>
-                        {job.type === "import" ? "导入" : "导出"} #{job.id}
+          {loadingJobs && jobs.length === 0 ? (
+            <Skeleton active paragraph={{ rows: 3 }} title={false} />
+          ) : (
+            <List
+              dataSource={jobs}
+              locale={{ emptyText: "暂无任务" }}
+              renderItem={(job) => {
+                const progress = job.total_discovered > 0 ? Math.round((job.processed_count / job.total_discovered) * 100) : job.status === "completed" ? 100 : 0;
+                return (
+                  <List.Item>
+                    <div className="job-item">
+                      <div className="job-item-head">
+                        <Text strong>
+                          {job.type === "import" ? "导入" : job.type === "maintenance" ? "维护" : "导出"} #{job.id}
+                        </Text>
+                        <Tag color={job.status === "completed" ? "success" : job.status === "failed" ? "error" : "processing"}>
+                          {job.status}
+                        </Tag>
+                      </div>
+                      <Progress percent={progress} size="small" />
+                      <Text type="secondary">
+                        {job.type === "export"
+                          ? `范围：${EXPORT_SCOPE_LABELS[String(job.params.scope) as ExportScope] ?? "未知"}${Array.isArray(job.params.class_keys) && job.params.class_keys.length > 0 ? ` · ${job.params.class_keys.length} 个分类` : " · 全部分类"}`
+                          : job.progress_message}
                       </Text>
-                      <Tag color={job.status === "completed" ? "success" : job.status === "failed" ? "error" : "processing"}>
-                        {job.status}
-                      </Tag>
                     </div>
-                    <Progress percent={progress} size="small" />
-                    <Text type="secondary">
-                      {job.type === "export"
-                        ? `范围：${EXPORT_SCOPE_LABELS[String(job.params.scope) as ExportScope] ?? "未知"}${Array.isArray(job.params.class_keys) && job.params.class_keys.length > 0 ? ` · ${job.params.class_keys.length} 个分类` : " · 全部分类"}`
-                        : job.progress_message}
-                    </Text>
-                  </div>
-                </List.Item>
-              );
-            }}
-          />
+                  </List.Item>
+                );
+              }}
+            />
+          )}
         </div>
       </Card>
 
       <Card title="最近剔除" size="small" className="scroll-card">
         <div className="scroll-list-wrap excluded-list-wrap">
-          <List
-            dataSource={recentExcluded}
-            locale={{ emptyText: "暂无已剔除光谱" }}
-            renderItem={(item) => (
-              <List.Item
-                className="recent-item"
-                actions={[
-                  <Button key={`restore-${item.id}`} type="link" icon={<UndoOutlined />} onClick={() => void restoreSpectrumItem(item)}>
-                    恢复
-                  </Button>
-                ]}
-              >
-                <List.Item.Meta
-                  title={
-                    <Tooltip title={item.file_name}>
-                      <span className="ellipsis-text">{item.file_name}</span>
-                    </Tooltip>
-                  }
-                  description={item.class_display_name}
-                />
-              </List.Item>
-            )}
-          />
+          {loadingRecentExcluded && recentExcluded.length === 0 ? (
+            <Skeleton active paragraph={{ rows: 3 }} title={false} />
+          ) : (
+            <List
+              dataSource={recentExcluded}
+              locale={{ emptyText: "暂无已剔除光谱" }}
+              renderItem={(item) => (
+                <List.Item
+                  className="recent-item"
+                  actions={[
+                    <Button key={`restore-${item.id}`} type="link" icon={<UndoOutlined />} onClick={() => void restoreSpectrumItem(item)}>
+                      恢复
+                    </Button>
+                  ]}
+                >
+                  <List.Item.Meta
+                    title={
+                      <Tooltip title={item.file_name}>
+                        <span className="ellipsis-text">{item.file_name}</span>
+                      </Tooltip>
+                    }
+                    description={item.class_display_name}
+                  />
+                </List.Item>
+              )}
+            />
+          )}
         </div>
       </Card>
     </div>
@@ -870,42 +947,38 @@ function Workspace() {
                       ]}
                     />
                     <div className="scroll-list-wrap class-list-wrap">
-                      <List
-                        className="class-list"
-                        dataSource={filteredClasses}
-                        locale={{ emptyText: "没有匹配的分类" }}
-                        renderItem={(item) => (
-                          <List.Item className={`class-list-item ${selectedClass?.class_key === item.class_key ? "is-selected" : ""}`}>
-                            <button
-                              className="class-select-button"
-                              onClick={() => {
-                                loadRequestIdRef.current += 1;
-                                setLoadingSpectra(true);
-                                setSelectedClass(item);
-                                setSubsets([]);
-                                setActiveSubsetId(undefined);
-                                setHoveredSpectrumId(null);
-                                setLockedSpectrumId(null);
-                                setPendingUndoSpectrum(null);
-                                setSpectra([]);
-                                setSpectraTotal(0);
-                                setAxisSummary([]);
-                                setSelectedAxisKind(undefined);
-                                setChartInteractionState({ hoveredSpectrum: null, lockedSpectrum: null });
-                                setChartResetToken((current) => current + 1);
-                              }}
-                            >
-                              <div className="class-list-title">{item.class_display_name}</div>
-                              <Space wrap size={[4, 8]}>
-                                <Tag>{item.component_count} 组分</Tag>
-                                <Tag color="blue">总数 {item.total_count}</Tag>
-                                <Tag color="success">有效 {item.active_count}</Tag>
-                                <Tag color="default">剔除 {item.excluded_count}</Tag>
-                              </Space>
-                            </button>
-                          </List.Item>
-                        )}
-                      />
+                      {loadingClasses && classes.length === 0 ? (
+                        <Skeleton active paragraph={{ rows: 8 }} title={false} />
+                      ) : (
+                        <List
+                          className="class-list"
+                          dataSource={filteredClasses}
+                          locale={{ emptyText: classesMeta.status === "building" ? "分类索引初始化中..." : "没有匹配的分类" }}
+                          renderItem={(item) => (
+                            <List.Item className={`class-list-item ${selectedClass?.class_key === item.class_key ? "is-selected" : ""}`}>
+                              <button
+                                className="class-select-button"
+                                onClick={() => {
+                                  setSelectedClass(item);
+                                  setSubsets([]);
+                                  setActiveSubsetId(undefined);
+                                  setPendingUndoSpectrum(null);
+                                  clearPreviewState(true);
+                                  setChartResetToken((current) => current + 1);
+                                }}
+                              >
+                                <div className="class-list-title">{item.class_display_name}</div>
+                                <Space wrap size={[4, 8]}>
+                                  <Tag>{item.component_count} 组分</Tag>
+                                  <Tag color="blue">总数 {item.total_count}</Tag>
+                                  <Tag color="success">有效 {item.active_count}</Tag>
+                                  <Tag color="default">剔除 {item.excluded_count}</Tag>
+                                </Space>
+                              </button>
+                            </List.Item>
+                          )}
+                        />
+                      )}
                     </div>
                   </Space>
                 </Card>
@@ -931,13 +1004,26 @@ function Workspace() {
                   </Button>
                 </div>
 
+                {classesMeta.status === "building" && (
+                  <Alert
+                    type="info"
+                    showIcon
+                    message="分类索引初始化中"
+                    description={classesMeta.progress_message ?? "检测到已有光谱数据，正在构建分类缓存，页面会自动刷新。"}
+                  />
+                )}
+
                 <Card className="status-strip" size="small">
-                  <div className="status-grid">
-                    <Statistic title="分类数量" value={classes.length} valueStyle={{ fontSize: 24, lineHeight: 1.1 }} />
-                    <Statistic title="当前分类总量" value={selectedClass?.total_count ?? 0} valueStyle={{ fontSize: 24, lineHeight: 1.1 }} />
-                    <Statistic title="当前载入曲线" value={previewSpectra.length} valueStyle={{ fontSize: 24, lineHeight: 1.1 }} />
-                    <Statistic title="最近任务数" value={jobs.length} valueStyle={{ fontSize: 24, lineHeight: 1.1 }} />
-                  </div>
+                  {loadingClasses && classes.length === 0 ? (
+                    <Skeleton active title={false} paragraph={{ rows: 1 }} />
+                  ) : (
+                    <div className="status-grid">
+                      <Statistic title="分类数量" value={classes.length} valueStyle={{ fontSize: 24, lineHeight: 1.1 }} />
+                      <Statistic title="当前分类总量" value={selectedClass?.total_count ?? 0} valueStyle={{ fontSize: 24, lineHeight: 1.1 }} />
+                      <Statistic title="当前载入曲线" value={previewSpectra.length} valueStyle={{ fontSize: 24, lineHeight: 1.1 }} />
+                      <Statistic title="最近任务数" value={jobs.length} valueStyle={{ fontSize: 24, lineHeight: 1.1 }} />
+                    </div>
+                  )}
                 </Card>
 
                 <Card
@@ -966,16 +1052,7 @@ function Workspace() {
                       <Button
                         icon={<ReloadOutlined />}
                         disabled={!selectedClass}
-                        onClick={() => {
-                          if (!selectedClass) {
-                            return;
-                          }
-                          if (selectedAxisKind) {
-                            void loadSpectra(selectedClass, excludedFilter, activeSubsetId, selectedAxisKind);
-                            return;
-                          }
-                          void probeAxisSummary(selectedClass, excludedFilter, activeSubsetId);
-                        }}
+                        onClick={() => void reloadPreview(selectedAxisKind)}
                       >
                         刷新
                       </Button>
@@ -1049,7 +1126,7 @@ function Workspace() {
                       </Tooltip>
                       {selectedAxisLabel && <Tag>{selectedAxisLabel}</Tag>}
                       <Text type="secondary">可预览：{previewSpectra.length}</Text>
-                      <Button size="small" icon={<ReloadOutlined />} onClick={() => setChartResetToken((current) => current + 1)} disabled={!selectedClass || !canRender}>
+                      <Button size="small" icon={<ReloadOutlined />} onClick={() => setChartResetToken((current) => current + 1)} disabled={!selectedClass || !canRender || previewSpectra.length === 0}>
                         恢复默认缩放
                       </Button>
                     </Space>
@@ -1060,7 +1137,10 @@ function Workspace() {
                     <div className="axis-switch-wrap">
                       <Segmented
                         value={selectedAxisKind}
-                        onChange={(value) => setSelectedAxisKind(value as AxisKind)}
+                        onChange={(value) => {
+                          setLockedSpectrum(null);
+                          setSelectedAxisKind(value as AxisKind);
+                        }}
                         options={axisSummary.map((item) => ({
                           value: item.axis_kind,
                           label: `${getAxisDisplayLabel(item.axis_kind, item.axis_unit)} (${item.count})`
@@ -1068,47 +1148,60 @@ function Workspace() {
                       />
                     </div>
                   )}
-                  {selectedClass && !canRender && (
+                  {selectedClass && previewLoad.active && (
+                    <div className="preview-progress-wrap">
+                      <Progress percent={previewLoad.percent} status="active" />
+                      <Text type="secondary">{previewLoad.message}</Text>
+                    </div>
+                  )}
+                  {selectedClass && chartDensityMode === "medium" && canRender && previewSpectra.length > 0 && (
+                    <Alert
+                      type="info"
+                      showIcon
+                      message="中等密度模式"
+                      description="当前曲线较多，悬停命中已节流优化，点击锁定与删除仍可正常使用。"
+                    />
+                  )}
+                  {selectedClass && chartDensityMode === "dense" && canRender && previewSpectra.length > 0 && (
                     <Alert
                       type="warning"
                       showIcon
-                      message={`当前结果共有 ${spectraTotal} 条，超过 2000 条渲染上限`}
-                      description="请先切分子集或缩小过滤条件后再预览。"
+                      message="高密度模式"
+                      description="当前曲线超过 800 条，已关闭悬停预览和悬停高亮，以保证缩放、平移和点击操作流畅。"
+                    />
+                  )}
+                  {selectedClass && !canRender && previewLimitMessage && (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      message="当前轴类型超过渲染上限"
+                      description={previewLimitMessage}
                     />
                   )}
                   {selectedClass && canRender && (
-                    <Spin spinning={loadingSpectra} tip="正在加载光谱数据...">
-                      <>
-                        {previewSpectra.length === 0 && !loadingSpectra ? (
-                          <Empty
-                            description={
-                              excludedFilter === "excluded"
-                                ? `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的已剔除光谱。`
-                                : excludedFilter === "all"
-                                  ? `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的光谱。`
-                                  : `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的未剔除光谱。`
-                            }
-                          />
-                        ) : (
-                          <SpectrumChart
-                            key={`${selectedClass.class_key}:${excludedFilter}:${selectedAxisKind ?? "all"}:${activeSubsetId ?? "all"}`}
-                            spectra={previewSpectra}
-                            resetSignal={chartResetToken}
-                            hoveredSpectrumId={hoveredSpectrumId}
-                            lockedSpectrumId={lockedSpectrumId}
-                            onHoverSpectrum={(spectrum) => {
-                              setHoveredSpectrumId(spectrum?.id ?? null);
-                              setChartInteractionState((current) => ({ ...current, hoveredSpectrum: spectrum }));
-                            }}
-                            onLockSpectrum={(spectrum) => {
-                              setLockedSpectrumId(spectrum?.id ?? null);
-                              setChartInteractionState((current) => ({ ...current, lockedSpectrum: spectrum }));
-                            }}
-                            onQuickExclude={(spectrum) => void handleExclude(spectrum)}
-                          />
-                        )}
-                      </>
-                    </Spin>
+                    <>
+                      {previewSpectra.length === 0 && !previewLoad.active ? (
+                        <Empty
+                          description={
+                            excludedFilter === "excluded"
+                              ? `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的已剔除光谱。`
+                              : excludedFilter === "all"
+                                ? `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的光谱。`
+                                : `当前${selectedAxisLabel ?? "所选轴类型"}没有可预览的未剔除光谱。`
+                          }
+                        />
+                      ) : (
+                        <SpectrumChart
+                          key={`${selectedClass.class_key}:${excludedFilter}:${selectedAxisKind ?? "all"}:${activeSubsetId ?? "all"}`}
+                          spectra={previewSpectra}
+                          resetSignal={chartResetToken}
+                          lockedSpectrumId={lockedSpectrum?.id ?? null}
+                          interactionMode={chartDensityMode}
+                          onLockSpectrum={setLockedSpectrum}
+                          onQuickExclude={(spectrum) => void handleExclude(spectrum)}
+                        />
+                      )}
+                    </>
                   )}
                 </Card>
 

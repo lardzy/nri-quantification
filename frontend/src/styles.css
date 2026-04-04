@@ -245,6 +245,13 @@ body {
   margin-bottom: 12px;
 }
 
+.preview-progress-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
 .current-class-pill {
   max-width: 280px;
   overflow: hidden;

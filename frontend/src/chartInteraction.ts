@@ -8,6 +8,13 @@ export type SpectrumHit = {
   yValue: number;
 };
 
+export type HitTestSpectrum = {
+  spectrum: SpectrumItem;
+  x_values: number[];
+  y_values: number[];
+  index_map: number[];
+};
+
 export type Extent = [number, number];
 
 export function formatSpectrumLabels(labels: SpectrumItem["labels"]): string {
@@ -37,7 +44,7 @@ export function findNearestPointIndex(values: number[], target: number): number 
 }
 
 export function findNearestSpectrumHit(params: {
-  spectra: SpectrumItem[];
+  spectra: Array<Pick<HitTestSpectrum, "spectrum" | "x_values" | "y_values" | "index_map">>;
   xValue: number;
   yValue: number;
   yThreshold: number;
@@ -66,8 +73,8 @@ export function findNearestSpectrumHit(params: {
 
     if (bestHit === null || distance < bestHit.distance) {
       bestHit = {
-        spectrum,
-        pointIndex,
+        spectrum: spectrum.spectrum,
+        pointIndex: spectrum.index_map[pointIndex] ?? pointIndex,
         distance,
         xValue: spectrum.x_values[pointIndex],
         yValue: pointY
@@ -178,4 +185,45 @@ export function shiftZoomWindow(start: number, end: number, deltaPercent: number
   const maxStart = 100 - width;
   const nextStart = Math.min(maxStart, Math.max(minStart, start + deltaPercent));
   return [nextStart, nextStart + width];
+}
+
+export function buildHitTestSpectra(spectra: SpectrumItem[], maxPointsPerSpectrum = 512): HitTestSpectrum[] {
+  return spectra.map((spectrum) => downsampleSpectrumForHitTest(spectrum, maxPointsPerSpectrum));
+}
+
+export function downsampleSpectrumForHitTest(spectrum: SpectrumItem, maxPoints = 512): HitTestSpectrum {
+  const totalPoints = Math.min(spectrum.x_values.length, spectrum.y_values.length);
+  if (totalPoints <= maxPoints) {
+    return {
+      spectrum,
+      x_values: spectrum.x_values,
+      y_values: spectrum.y_values,
+      index_map: spectrum.x_values.map((_, index) => index)
+    };
+  }
+
+  const stride = Math.max(1, Math.floor(totalPoints / maxPoints));
+  const x_values: number[] = [];
+  const y_values: number[] = [];
+  const index_map: number[] = [];
+
+  for (let index = 0; index < totalPoints; index += stride) {
+    x_values.push(spectrum.x_values[index]);
+    y_values.push(spectrum.y_values[index]);
+    index_map.push(index);
+  }
+
+  const lastIndex = totalPoints - 1;
+  if (index_map[index_map.length - 1] !== lastIndex) {
+    x_values.push(spectrum.x_values[lastIndex]);
+    y_values.push(spectrum.y_values[lastIndex]);
+    index_map.push(lastIndex);
+  }
+
+  return {
+    spectrum,
+    x_values,
+    y_values,
+    index_map
+  };
 }

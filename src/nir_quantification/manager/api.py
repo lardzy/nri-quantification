@@ -16,7 +16,18 @@ from .config import ManagerSettings
 from .db import decode_json, session_scope
 from .jobs import JobManager
 from .models import Job, Spectrum
-from .service import axis_summary_for_query, job_to_dict, list_classes, spectrum_query, spectrum_to_dict, utcnow
+from .service import (
+    class_stats_status,
+    fetch_recent_excluded,
+    fetch_spectra,
+    job_to_dict,
+    list_classes,
+    recompute_class_stats,
+    spectra_summary,
+    spectrum_query,
+    spectrum_to_dict,
+    utcnow,
+)
 
 
 class ImportJobRequest(BaseModel):
@@ -133,7 +144,28 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
         sort: Literal["count", "component_count", "name"] = "count",
         session: Session = Depends(get_session),
     ) -> dict:
-        return {"items": list_classes(session, sort_by=sort)}
+        return {
+            "items": list_classes(session, sort_by=sort),
+            "meta": class_stats_status(session),
+        }
+
+    @router.get("/spectra/summary")
+    def spectra_summary_endpoint(
+        class_key: str | None = None,
+        excluded: Literal["active", "excluded", "all"] = "active",
+        component_count: int | None = None,
+        subset_id: str | None = None,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        subset_spectrum_ids: list[int] | None = None
+        if subset_id:
+            subset = job_manager.subsets.get(subset_id)
+            if subset is None:
+                raise HTTPException(status_code=404, detail="subset not found")
+            subset_spectrum_ids = list(subset["spectrum_ids"])
+        payload = spectra_summary(session, class_key, excluded, component_count, None, subset_spectrum_ids)
+        payload.update(class_stats_status(session))
+        return payload
 
     @router.get("/spectra")
     def spectra(
@@ -151,15 +183,21 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
             if subset is None:
                 raise HTTPException(status_code=404, detail="subset not found")
             subset_spectrum_ids = list(subset["spectrum_ids"])
-        axis_summary = axis_summary_for_query(session, class_key, excluded, component_count, subset_spectrum_ids)
-        stmt = spectrum_query(session, class_key, excluded, component_count, axis_kind, subset_spectrum_ids)
-        total = int(session.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0)
-        spectra_items = session.scalars(stmt.limit(limit)).unique().all()
+        summary = spectra_summary(session, class_key, excluded, component_count, axis_kind, subset_spectrum_ids)
+        spectra_items = fetch_spectra(
+            session,
+            class_key=class_key,
+            excluded=excluded,
+            component_count=component_count,
+            axis_kind=axis_kind,
+            subset_spectrum_ids=subset_spectrum_ids,
+            limit=limit,
+        )
         return {
-            "items": [spectrum_to_dict(item) for item in spectra_items],
-            "count": total,
+            "items": spectra_items,
+            "count": summary["total_count"],
             "limit": limit,
-            "axis_summary": axis_summary,
+            "axis_summary": spectra_summary(session, class_key, excluded, component_count, None, subset_spectrum_ids)["axis_summary"],
         }
 
     @router.post("/spectra/{spectrum_id}/exclude")
@@ -169,6 +207,7 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
             raise HTTPException(status_code=404, detail="spectrum not found")
         spectrum.is_excluded = True
         spectrum.excluded_at = utcnow()
+        recompute_class_stats(session, [spectrum.class_key])
         session.flush()
         return spectrum_to_dict(spectrum)
 
@@ -179,6 +218,7 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
             raise HTTPException(status_code=404, detail="spectrum not found")
         spectrum.is_excluded = False
         spectrum.excluded_at = None
+        recompute_class_stats(session, [spectrum.class_key])
         session.flush()
         return spectrum_to_dict(spectrum)
 
@@ -200,9 +240,7 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
 
     @router.get("/excluded/recent")
     def recent_excluded(limit: Annotated[int, Query(ge=1, le=200)] = 50, session: Session = Depends(get_session)) -> dict:
-        stmt = select(Spectrum).where(Spectrum.is_excluded.is_(True)).order_by(Spectrum.excluded_at.desc()).limit(limit)
-        spectra_items = session.scalars(stmt).unique().all()
-        return {"items": [spectrum_to_dict(item) for item in spectra_items]}
+        return {"items": fetch_recent_excluded(session, limit=limit)}
 
     @router.get("/jobs")
     def list_jobs(limit: Annotated[int, Query(ge=1, le=200)] = 20, session: Session = Depends(get_session)) -> dict:

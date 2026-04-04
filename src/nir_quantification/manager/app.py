@@ -20,6 +20,7 @@ def create_app(settings: ManagerSettings | None = None) -> FastAPI:
     session_factory = create_session_factory(engine)
     parser_registry = ParserRegistry()
     job_manager = JobManager(settings=settings, session_factory=session_factory, parser_registry=parser_registry)
+    job_manager.ensure_class_stats()
 
     app = FastAPI(title="NIR Spectrum Manager")
     app.state.settings = settings

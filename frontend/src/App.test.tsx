@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -84,36 +84,24 @@ vi.mock("./SpectrumChart", () => ({
   SpectrumChart: ({
     spectra,
     resetSignal: _resetSignal,
-    onHoverSpectrum,
     onLockSpectrum,
-    onQuickExclude
+    onQuickExclude,
+    interactionMode
   }: {
     spectra: Array<typeof baseSpectrum>;
     resetSignal: number;
-    onHoverSpectrum: (spectrum: typeof baseSpectrum | null) => void;
     onLockSpectrum: (spectrum: typeof baseSpectrum | null) => void;
     onQuickExclude: (spectrum: typeof baseSpectrum) => void;
+    interactionMode: "full" | "medium" | "dense";
   }) => (
-    <div data-testid="mock-chart">
+    <div data-testid="mock-chart" data-mode={interactionMode}>
       {spectra.map((spectrum) => (
-        <button
-          key={spectrum.id}
-          onMouseEnter={() => onHoverSpectrum(spectrum)}
-          onMouseLeave={() => onHoverSpectrum(null)}
-          onClick={(event) => {
-            if (event.shiftKey) {
-              onQuickExclude(spectrum);
-              return;
-            }
-            onLockSpectrum(spectrum);
-          }}
-          onContextMenu={(event) => {
-            event.preventDefault();
-            onQuickExclude(spectrum);
-          }}
-        >
-          {spectrum.file_name}
-        </button>
+        <div key={spectrum.id}>
+          <button onClick={() => onLockSpectrum(spectrum)}>{spectrum.file_name}</button>
+          <button aria-label={`quick-exclude-${spectrum.file_name}`} onClick={() => onQuickExclude(spectrum)}>
+            quick exclude
+          </button>
+        </div>
       ))}
     </div>
   )
@@ -127,6 +115,7 @@ vi.mock("./api", () => ({
     createExportJob: vi.fn(),
     listJobs: vi.fn(),
     getClasses: vi.fn(),
+    getSpectraSummary: vi.fn(),
     getSpectra: vi.fn(),
     excludeSpectrum: vi.fn(),
     restoreSpectrum: vi.fn(),
@@ -192,26 +181,28 @@ describe("App", () => {
       finished_at: null,
       updated_at: null
     });
-    vi.mocked(api.getClasses).mockImplementation(async () => [
-      {
-        ...baseClass,
-        active_count: excluded ? 1 : 2,
-        excluded_count: excluded ? 1 : 0
-      },
-      secondClass
-    ]);
-    vi.mocked(api.getSpectra).mockImplementation(async ({ classKey, excluded: filter, axisKind, limit }) => {
+    vi.mocked(api.getClasses).mockImplementation(async () => ({
+      items: [
+        {
+          ...baseClass,
+          active_count: excluded ? 1 : 2,
+          excluded_count: excluded ? 1 : 0
+        },
+        secondClass
+      ],
+      meta: { status: "ready", progress_message: null }
+    }));
+    vi.mocked(api.getSpectraSummary).mockImplementation(async ({ classKey, excluded: filter }) => {
       if (classKey === secondClass.class_key) {
-        const summary: AxisSummary[] = filter === "excluded" ? [] : wavelengthAxisSummary;
-        const items =
-          filter === "active" || filter === "all"
-            ? [{ ...secondSpectrum, is_excluded: false }]
-            : [];
-        return { items, count: items.length, limit: limit ?? 2000, axis_summary: summary };
+        const axisSummary: AxisSummary[] = filter === "excluded" ? [] : wavelengthAxisSummary;
+        return {
+          status: "ready",
+          progress_message: null,
+          total_count: filter === "excluded" ? 0 : 1,
+          axis_summary: axisSummary
+        };
       }
 
-      const wavelengthSpectrum = { ...baseSpectrum, is_excluded: excluded };
-      const wavenumberSpectrum = { ...fourierSpectrum, is_excluded: false };
       const axisSummary: AxisSummary[] =
         filter === "excluded"
           ? excluded
@@ -222,7 +213,34 @@ describe("App", () => {
             : excluded
               ? wavenumberAxisSummary
               : mixedAxisSummary;
+      const totalCount =
+        filter === "excluded"
+          ? excluded
+            ? 1
+            : 0
+          : filter === "all"
+            ? 2
+            : excluded
+              ? 1
+              : 2;
+      return {
+        status: "ready",
+        progress_message: null,
+        total_count: totalCount,
+        axis_summary: axisSummary
+      };
+    });
+    vi.mocked(api.getSpectra).mockImplementation(async ({ classKey, excluded: filter, axisKind, limit }) => {
+      if (classKey === secondClass.class_key) {
+        const items =
+          filter === "active" || filter === "all"
+            ? [{ ...secondSpectrum, is_excluded: false }]
+            : [];
+        return { items, count: items.length, limit: limit ?? 2000, axis_summary: wavelengthAxisSummary };
+      }
 
+      const wavelengthSpectrum = { ...baseSpectrum, is_excluded: excluded };
+      const wavenumberSpectrum = { ...fourierSpectrum, is_excluded: false };
       let items =
         filter === "excluded"
           ? excluded
@@ -238,9 +256,9 @@ describe("App", () => {
       }
       return {
         items,
-        count: items.length,
+        count: filter === "all" ? 2 : items.length,
         limit: limit ?? 2000,
-        axis_summary: axisSummary
+        axis_summary: filter === "all" ? mixedAxisSummary : axisKind === "wavenumber" ? wavenumberAxisSummary : wavelengthAxisSummary
       };
     });
     vi.mocked(api.excludeSpectrum).mockImplementation(async () => {
@@ -284,29 +302,29 @@ describe("App", () => {
 
     await user.click(screen.getByText("波数 (cm^-1) (1)"));
     await waitFor(() =>
-      expect(api.getSpectra).toHaveBeenLastCalledWith({
-        classKey: baseClass.class_key,
-        excluded: "active",
-        axisKind: "wavenumber",
-        subsetId: undefined,
-        limit: 2000
-      })
+      expect(api.getSpectra).toHaveBeenLastCalledWith(
+        {
+          classKey: baseClass.class_key,
+          excluded: "active",
+          axisKind: "wavenumber",
+          subsetId: undefined,
+          limit: 2000
+        },
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      )
     );
     expect(await screen.findByRole("button", { name: fourierSpectrum.file_name })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: baseSpectrum.file_name })).not.toBeInTheDocument();
   });
 
-  it("supports shift-left and right-click quick exclude from the chart", async () => {
+  it("supports quick exclude actions from the chart callback path", async () => {
+    const user = userEvent.setup();
     render(<App />);
 
     await waitFor(() => expect(api.getSpectra).toHaveBeenCalled());
-    const curveButton = await screen.findByRole("button", { name: baseSpectrum.file_name });
+    const quickExcludeButton = await screen.findByRole("button", { name: `quick-exclude-${baseSpectrum.file_name}` });
 
-    fireEvent.click(curveButton, { shiftKey: true });
-    await waitFor(() => expect(api.excludeSpectrum).toHaveBeenCalledWith(baseSpectrum.id));
-
-    vi.mocked(api.excludeSpectrum).mockClear();
-    fireEvent.contextMenu(curveButton);
+    await user.click(quickExcludeButton);
     await waitFor(() => expect(api.excludeSpectrum).toHaveBeenCalledWith(baseSpectrum.id));
   });
 
@@ -315,9 +333,9 @@ describe("App", () => {
     render(<App />);
 
     await waitFor(() => expect(api.getSpectra).toHaveBeenCalled());
-    const curveButton = await screen.findByRole("button", { name: baseSpectrum.file_name });
+    const quickExcludeButton = await screen.findByRole("button", { name: `quick-exclude-${baseSpectrum.file_name}` });
 
-    fireEvent.click(curveButton, { shiftKey: true });
+    await user.click(quickExcludeButton);
     await waitFor(() => expect(api.excludeSpectrum).toHaveBeenCalledWith(baseSpectrum.id));
     await waitFor(() => expect(screen.queryByRole("button", { name: baseSpectrum.file_name })).not.toBeInTheDocument());
 
@@ -325,15 +343,54 @@ describe("App", () => {
     await user.click(await screen.findByText("仅剔除"));
 
     await waitFor(() =>
-      expect(api.getSpectra).toHaveBeenLastCalledWith({
-        classKey: baseClass.class_key,
-        excluded: "excluded",
-        axisKind: "wavelength",
-        subsetId: undefined,
-        limit: 2000
-      })
+      expect(api.getSpectra).toHaveBeenLastCalledWith(
+        {
+          classKey: baseClass.class_key,
+          excluded: "excluded",
+          axisKind: "wavelength",
+          subsetId: undefined,
+          limit: 2000
+        },
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      )
     );
     expect(await screen.findByRole("button", { name: baseSpectrum.file_name })).toBeInTheDocument();
+  });
+
+  it("shows an initialization hint instead of a blank page while class stats are building", async () => {
+    vi.mocked(api.getClasses).mockResolvedValueOnce({
+      items: [],
+      meta: { status: "building", progress_message: "正在初始化分类索引" }
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("分类索引初始化中")).toBeInTheDocument();
+    expect(screen.getByText(/正在初始化分类索引/)).toBeInTheDocument();
+  });
+
+  it("short-circuits oversized axis previews before requesting detail data", async () => {
+    vi.mocked(api.getSpectraSummary).mockImplementationOnce(async ({ classKey }) => {
+      if (classKey !== baseClass.class_key) {
+        return {
+          status: "ready",
+          progress_message: null,
+          total_count: 1,
+          axis_summary: wavelengthAxisSummary
+        };
+      }
+      return {
+        status: "ready",
+        progress_message: null,
+        total_count: 7000,
+        axis_summary: [{ axis_kind: "wavelength", axis_unit: "nm", count: 7000 }]
+      };
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText(/超过 2000 条渲染上限/)).toBeInTheDocument();
+    expect(api.getSpectra).not.toHaveBeenCalled();
   });
 
   it("shows sample id, acquisition time and part metadata for new formats", async () => {

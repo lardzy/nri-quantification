@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 
 from nir_quantification.manager.app import create_app
 from nir_quantification.manager.config import ManagerSettings
+from nir_quantification.manager.db import session_scope
+from nir_quantification.manager.models import ClassStat
 
 
 def make_csv_text(labels: list[tuple[str, float]], point_count: int = 228) -> str:
@@ -63,7 +65,7 @@ class ManagerTests(unittest.TestCase):
         self.import_root.mkdir()
         self.export_root.mkdir()
 
-        settings = ManagerSettings(
+        self.settings = ManagerSettings(
             db_path=self.base_dir / "data" / "spectra.sqlite3",
             import_roots=[self.import_root],
             export_roots=[self.export_root],
@@ -71,7 +73,7 @@ class ManagerTests(unittest.TestCase):
             max_workers=2,
             job_batch_size=2,
         )
-        self.client = TestClient(create_app(settings))
+        self.client = TestClient(create_app(self.settings))
 
     def tearDown(self) -> None:
         self.client.close()
@@ -110,7 +112,9 @@ class ManagerTests(unittest.TestCase):
         browse = self.client.get("/api/fs/browse", params={"kind": "import", "path": str(nested_b)}).json()
         self.assertEqual(browse["parent_path"], str(self.import_root.resolve()))
 
-        classes = self.client.get("/api/classes", params={"sort": "name"}).json()["items"]
+        classes_payload = self.client.get("/api/classes", params={"sort": "name"}).json()
+        self.assertEqual(classes_payload["meta"]["status"], "ready")
+        classes = classes_payload["items"]
         self.assertEqual(len(classes), 1)
         self.assertEqual(classes[0]["class_key"], "棉|锦纶")
         self.assertEqual(classes[0]["total_count"], 4)
@@ -147,15 +151,30 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(subset_spectra["count"], 2)
         self.assertEqual(len(subset_spectra["items"]), 2)
 
+        summary_payload = self.client.get(
+            "/api/spectra/summary",
+            params={"class_key": class_key, "excluded": "active", "subset_id": ratio_subset_ids[0]},
+        ).json()
+        self.assertEqual(summary_payload["status"], "ready")
+        self.assertEqual(summary_payload["total_count"], 2)
+        self.assertEqual(summary_payload["axis_summary"][0]["count"], 2)
+
         spectrum_id = subset_spectra["items"][0]["id"]
         excluded = self.client.post(f"/api/spectra/{spectrum_id}/exclude").json()
         self.assertTrue(excluded["is_excluded"])
+
+        classes_after_exclude = self.client.get("/api/classes", params={"sort": "name"}).json()["items"]
+        self.assertEqual(classes_after_exclude[0]["active_count"], 3)
+        self.assertEqual(classes_after_exclude[0]["excluded_count"], 1)
 
         recent_excluded = self.client.get("/api/excluded/recent", params={"limit": 10}).json()["items"]
         self.assertEqual(recent_excluded[0]["id"], spectrum_id)
 
         restored = self.client.post(f"/api/spectra/{spectrum_id}/restore").json()
         self.assertFalse(restored["is_excluded"])
+        classes_after_restore = self.client.get("/api/classes", params={"sort": "name"}).json()["items"]
+        self.assertEqual(classes_after_restore[0]["active_count"], 4)
+        self.assertEqual(classes_after_restore[0]["excluded_count"], 0)
 
     def test_reimport_skips_existing_file_names(self) -> None:
         file_name = "ISC_Hadamard 1_聚酯纤维,100.0_ABC123_20240101_120000_1.csv"
@@ -295,6 +314,34 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(completed["imported_count"], 0)
         self.assertEqual(completed["failed_count"], 1)
+
+    def test_rebuilds_class_stats_on_startup_when_cache_is_missing(self) -> None:
+        file_name = "ISC_Hadamard 1_聚酯纤维,100.0_ABC123_20240101_120000_1.csv"
+        (self.import_root / file_name).write_text(make_csv_text([("聚酯纤维", 100.0)]), encoding="utf-8")
+
+        job = self.client.post("/api/import-jobs", json={"root_path": str(self.import_root), "recursive": True}).json()
+        self._wait_for_job(job["id"])
+
+        with session_scope(self.client.app.state.session_factory) as session:
+            session.query(ClassStat).delete()
+
+        restart_client = TestClient(create_app(self.settings))
+        try:
+            first_payload = restart_client.get("/api/classes").json()
+            self.assertIn(first_payload["meta"]["status"], {"building", "ready"})
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                payload = restart_client.get("/api/classes").json()
+                if payload["items"]:
+                    self.assertEqual(payload["meta"]["status"], "ready")
+                    self.assertEqual(payload["items"][0]["class_key"], "聚酯纤维")
+                    return
+                time.sleep(0.05)
+        finally:
+            restart_client.close()
+
+        self.fail("class stats were not rebuilt before timeout")
 
     def _wait_for_job(self, job_id: int, timeout_seconds: float = 10.0) -> dict:
         deadline = time.time() + timeout_seconds

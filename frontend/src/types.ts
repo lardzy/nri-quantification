@@ -19,12 +19,22 @@ export type SpectrumClass = {
   excluded_count: number;
 };
 
+export type LoadingMeta = {
+  status: "ready" | "building";
+  progress_message: string | null;
+};
+
 export type AxisKind = "wavelength" | "wavenumber";
 
 export type AxisSummary = {
   axis_kind: AxisKind;
   axis_unit: string;
   count: number;
+};
+
+export type SpectrumSummary = LoadingMeta & {
+  total_count: number;
+  axis_summary: AxisSummary[];
 };
 
 export type SpectrumItem = {

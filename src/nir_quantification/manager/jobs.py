@@ -7,14 +7,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
 from .config import ManagerSettings
 from .db import decode_json, encode_json, session_scope
-from .models import Job, Spectrum
+from .models import ClassStat, Job, Spectrum
 from .parsers import ParserRegistry
-from .service import job_to_dict, spectrum_query, upsert_spectrum_from_parsed, utcnow
+from .service import build_classification, job_to_dict, recompute_class_stats, spectrum_query, upsert_spectrum_from_parsed, utcnow
 
 
 class SubsetStore:
@@ -37,6 +37,19 @@ class JobManager:
         self.session_factory = session_factory
         self.parser_registry = parser_registry
         self.subsets = SubsetStore()
+
+    def ensure_class_stats(self) -> None:
+        with session_scope(self.session_factory) as session:
+            spectra_count = int(session.scalar(select(func.count()).select_from(Spectrum)) or 0)
+            stats_count = int(session.scalar(select(func.count()).select_from(ClassStat)) or 0)
+            running_job = session.scalar(
+                select(Job)
+                .where(Job.type == "maintenance", Job.status.in_(("pending", "running")))
+                .order_by(Job.created_at.desc())
+                .limit(1)
+            )
+        if spectra_count > 0 and stats_count == 0 and running_job is None:
+            self.create_class_stats_rebuild_job(reason="startup")
 
     def create_import_job(self, root_path: Path, recursive: bool = True) -> dict[str, Any]:
         with session_scope(self.session_factory) as session:
@@ -67,6 +80,21 @@ class JobManager:
             session.flush()
             job_id = job.id
         self._spawn(target=self._run_export_job, job_id=job_id)
+        return self.get_job(job_id)
+
+    def create_class_stats_rebuild_job(self, reason: str = "startup") -> dict[str, Any]:
+        with session_scope(self.session_factory) as session:
+            job = Job(
+                type="maintenance",
+                status="pending",
+                params_json=encode_json({"task": "class_stats_rebuild", "reason": reason}),
+                stats_json=encode_json({}),
+                progress_message="Queued",
+            )
+            session.add(job)
+            session.flush()
+            job_id = job.id
+        self._spawn(target=self._run_class_stats_rebuild_job, job_id=job_id)
         return self.get_job(job_id)
 
     def get_job(self, job_id: int) -> dict[str, Any]:
@@ -210,13 +238,17 @@ class JobManager:
         imported = skipped = 0
         if not batch:
             return imported, skipped
+        affected_class_keys: set[str] = set()
         with session_scope(self.session_factory) as session:
             for parsed in batch:
                 result = upsert_spectrum_from_parsed(session, parsed)
                 if result == "imported":
                     imported += 1
+                    affected_class_keys.add(build_classification(parsed.labels)[0])
                 else:
                     skipped += 1
+            if affected_class_keys:
+                recompute_class_stats(session, sorted(affected_class_keys))
         return imported, skipped
 
     def _run_export_job(self, job_id: int) -> None:
@@ -274,6 +306,30 @@ class JobManager:
                 imported_count=written,
                 failed_count=failed,
                 progress_message=f"Completed export: {written} written, {failed} failed",
+            )
+        except Exception as error:  # pragma: no cover
+            self._append_log(job_id, traceback.format_exc())
+            self._finish_job(job_id, status="failed", progress_message=str(error))
+
+    def _run_class_stats_rebuild_job(self, job_id: int) -> None:
+        with session_scope(self.session_factory) as session:
+            job = session.get(Job, job_id)
+            assert job is not None
+            total_classes = int(session.scalar(select(func.count(func.distinct(Spectrum.class_key)))) or 0)
+            job.status = "running"
+            job.started_at = utcnow()
+            job.total_discovered = total_classes
+            job.progress_message = "正在初始化分类索引"
+
+        try:
+            with session_scope(self.session_factory) as session:
+                rebuilt = recompute_class_stats(session)
+            self._finish_job(
+                job_id,
+                status="completed",
+                processed_count=rebuilt,
+                imported_count=rebuilt,
+                progress_message=f"分类索引初始化完成，共 {rebuilt} 个分类",
             )
         except Exception as error:  # pragma: no cover
             self._append_log(job_id, traceback.format_exc())
