@@ -361,6 +361,42 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(completed["imported_count"], 0)
         self.assertEqual(completed["failed_count"], 1)
 
+    def test_mixed_axis_subsets_preserve_both_axis_types(self) -> None:
+        labels = [("棉", 71.0), ("聚酯纤维", 29.0)]
+        for index in range(3):
+            file_name = f"SupNIR-3100230122253A{index + 1:02d}_2024092416390{index}.csv"
+            (self.import_root / file_name).write_text(make_grating_csv_text(labels), encoding="utf-8")
+        for index in range(5):
+            file_name = f"样品编号 23034022{index}  2025-09-09 08385{index} GMT+0800.csv"
+            (self.import_root / file_name).write_text(make_fourier_csv_text(labels, part_name="A"), encoding="utf-8")
+
+        job = self.client.post("/api/import-jobs", json={"root_path": str(self.import_root), "recursive": True}).json()
+        completed = self._wait_for_job(job["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["imported_count"], 8)
+
+        class_key = "棉|聚酯纤维"
+        subset_payload = self.client.post(
+            f"/api/classes/{class_key}/subsets",
+            json={"mode": "count", "parts": 2},
+        ).json()
+        self.assertEqual([item["count"] for item in subset_payload["subsets"]], [2, 2, 2, 2])
+
+        summary_payloads = [
+            self.client.get(
+                "/api/spectra/summary",
+                params={"class_key": class_key, "excluded": "active", "subset_id": subset["subset_id"]},
+            ).json()
+            for subset in subset_payload["subsets"]
+        ]
+        self.assertEqual(sum(payload["total_count"] for payload in summary_payloads), 8)
+        self.assertTrue(
+            any(
+                {item["axis_kind"] for item in payload["axis_summary"]} == {"wavelength", "wavenumber"}
+                for payload in summary_payloads
+            )
+        )
+
     def test_rebuilds_class_stats_on_startup_when_cache_is_missing(self) -> None:
         file_name = "ISC_Hadamard 1_聚酯纤维,100.0_ABC123_20240101_120000_1.csv"
         (self.import_root / file_name).write_text(make_csv_text([("聚酯纤维", 100.0)]), encoding="utf-8")

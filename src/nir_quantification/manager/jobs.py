@@ -174,22 +174,14 @@ class JobManager:
     ) -> dict[str, Any]:
         import uuid
 
-        spectrum_ids = [int(row["id"]) for row in spectra_rows]
         subsets: list[dict[str, Any]] = []
-        if mode == "count":
-            chunk_size = max(1, parts or 1)
-            groups = [spectra_rows[index:index + chunk_size] for index in range(0, len(spectra_rows), chunk_size)]
-        else:
-            raw_partition_count = parts if parts is not None else int(ratios[0]) if ratios else 1
-            partition_count = max(1, raw_partition_count)
-            base_size = len(spectrum_ids) // partition_count
-            remainder = len(spectrum_ids) % partition_count
-            groups = []
-            cursor = 0
-            for index in range(partition_count):
-                size = base_size + (1 if index < remainder else 0)
-                groups.append(spectra_rows[cursor:cursor + size])
-                cursor += size
+        target_sizes = self._build_subset_target_sizes(
+            total_count=len(spectra_rows),
+            mode=mode,
+            parts=parts,
+            ratios=ratios,
+        )
+        groups = self._distribute_rows_across_subsets(spectra_rows, target_sizes)
 
         for index, rows in enumerate(groups, start=1):
             if not rows:
@@ -199,6 +191,80 @@ class JobManager:
             self.subsets.put(subset_id, payload)
             subsets.append({"subset_id": subset_id, "index": index, "count": len(rows)})
         return {"class_key": class_key, "mode": mode, "subsets": subsets}
+
+    def _build_subset_target_sizes(
+        self,
+        total_count: int,
+        mode: str,
+        parts: int | None,
+        ratios: list[float] | None,
+    ) -> list[int]:
+        if total_count <= 0:
+            return []
+        if mode == "count":
+            chunk_size = max(1, parts or 1)
+            return [
+                min(chunk_size, total_count - index)
+                for index in range(0, total_count, chunk_size)
+            ]
+
+        raw_partition_count = parts if parts is not None else int(ratios[0]) if ratios else 1
+        partition_count = max(1, raw_partition_count)
+        base_size = total_count // partition_count
+        remainder = total_count % partition_count
+        return [
+            base_size + (1 if index < remainder else 0)
+            for index in range(partition_count)
+            if base_size + (1 if index < remainder else 0) > 0
+        ]
+
+    def _distribute_rows_across_subsets(
+        self,
+        spectra_rows: list[dict[str, Any]],
+        target_sizes: list[int],
+    ) -> list[list[dict[str, Any]]]:
+        if not spectra_rows or not target_sizes:
+            return []
+        if len(target_sizes) == 1:
+            return [sorted(spectra_rows, key=lambda row: str(row["file_name"]))]
+
+        grouped_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in spectra_rows:
+            axis_key = (str(row["axis_kind"]), str(row["axis_unit"]))
+            grouped_rows.setdefault(axis_key, []).append(row)
+
+        axis_priority = {"wavelength": 0, "wavenumber": 1}
+        axis_keys = sorted(
+            grouped_rows.keys(),
+            key=lambda key: (
+                len(grouped_rows[key]),
+                axis_priority.get(key[0], 99),
+                key[1],
+            ),
+        )
+
+        buckets: list[list[dict[str, Any]]] = [[] for _ in target_sizes]
+        remaining_capacity = list(target_sizes)
+        bucket_count = len(buckets)
+
+        for axis_key in axis_keys:
+            bucket_index = 0
+            axis_rows = sorted(grouped_rows[axis_key], key=lambda row: str(row["file_name"]))
+            for row in axis_rows:
+                start_index = bucket_index
+                while remaining_capacity[bucket_index] <= 0:
+                    bucket_index = (bucket_index + 1) % bucket_count
+                    if bucket_index == start_index:
+                        raise RuntimeError("subset capacity exhausted while distributing spectra")
+                buckets[bucket_index].append(row)
+                remaining_capacity[bucket_index] -= 1
+                bucket_index = (bucket_index + 1) % bucket_count
+
+        return [
+            sorted(bucket, key=lambda row: str(row["file_name"]))
+            for bucket in buckets
+            if bucket
+        ]
 
     def _build_subset_payload(
         self,

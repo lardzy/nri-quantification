@@ -231,6 +231,7 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
         spectra_items = session.execute(
             select(
                 Spectrum.id,
+                Spectrum.file_name,
                 Spectrum.axis_kind,
                 Spectrum.axis_unit,
                 Spectrum.is_excluded,
@@ -241,6 +242,7 @@ def create_router(settings: ManagerSettings, session_factory: sessionmaker, job_
         spectra_rows = [
             {
                 "id": int(item.id),
+                "file_name": item.file_name,
                 "axis_kind": item.axis_kind,
                 "axis_unit": item.axis_unit,
                 "is_excluded": bool(item.is_excluded),
