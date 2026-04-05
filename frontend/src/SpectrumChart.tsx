@@ -137,6 +137,8 @@ export function SpectrumChart({
         nameLocation: "middle",
         nameGap: 46,
         nameTextStyle: { fontWeight: 600, padding: [18, 0, 0, 0] },
+        min: axisExtents.xExtent[0],
+        max: axisExtents.xExtent[1],
         scale: true,
         splitNumber: 6,
         axisLabel: {
