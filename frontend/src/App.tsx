@@ -944,12 +944,15 @@ function Workspace() {
     setLockedSpectrum(null);
   }
 
+  const [creatingSubsets, setCreatingSubsets] = useState(false);
+
   async function createSubsets() {
     try {
       if (!selectedClass) {
         messageApi.warning("请先选择分类");
         return;
       }
+      setCreatingSubsets(true);
       const parts = Math.max(1, Number(subsetInput) || 1);
       const payload = { mode: subsetMode, parts } as const;
       const result = await api.createSubsets(selectedClass.class_key, payload);
@@ -960,6 +963,8 @@ function Workspace() {
       const messageText = String(error);
       setErrorText(messageText);
       messageApi.error(`子集切分失败：${messageText}`);
+    } finally {
+      setCreatingSubsets(false);
     }
   }
 
@@ -1372,7 +1377,7 @@ function Workspace() {
                         </div>
                       </div>
                       <Space wrap>
-                        <Button onClick={() => void createSubsets()} disabled={!selectedClass}>
+                        <Button loading={creatingSubsets} onClick={() => void createSubsets()} disabled={!selectedClass || creatingSubsets}>
                           生成子集
                         </Button>
                         <Button onClick={closeSubsets} disabled={subsets.length === 0 && !activeSubsetId}>
